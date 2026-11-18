@@ -121,6 +121,7 @@ mysql -e "INSERT INTO demo.orders VALUES (1, 99.50, 'new')"
 | `RELAY_CHECKPOINT_KEY` | binlog_relay:checkpoint:default | Redis key |
 | `RELAY_CHECKPOINT_EVERY` | 100 | 每 N 个事件落盘一次 |
 | `RELAY_CHECKPOINT_SECONDS` | 1.0 | 或每 N 秒落盘一次 |
+| `RELAY_FILE_FSYNC` | 0 | 点位文件是否 fsync；默认关闭（慢 1000 倍），需要更强持久性时开启 |
 | `RELAY_BATCH_SIZE` | 200 | 每批交给 handler 的变更数 |
 | `RELAY_LOG_LEVEL` | info | debug/info/warn/error |
 | `RELAY_LOG_FILE` | 空 | 空则打 stderr |
@@ -419,16 +420,17 @@ php tests/bench.php 20000
 
 | 项目 | 吞吐 | 单次耗时 |
 |---|---|---|
-| EventBuilder（每批 10 行展开） | ~104,000 批/秒 | 9.6 µs/批（≈0.96 µs/行） |
-| JSON 序列化（每条变更） | ~1,340,000 次/秒 | 0.74 µs |
-| HandlerChain 调度（1 个空 handler） | ~4,980,000 次/秒 | 0.20 µs |
-| FileStore 每次落盘（fsync+rename） | 57 次/秒 | 17.5 ms |
+| EventBuilder（每批 10 行展开） | ~135,000 批/秒 | 7.4 µs/批（≈0.74 µs/行） |
+| JSON 序列化（每条变更） | ~1,300,000 次/秒 | 0.75 µs |
+| HandlerChain 调度（1 个空 handler） | ~5,000,000 次/秒 | 0.20 µs |
+| FileStore 落盘（rename，默认） | 1,524 次/秒 | 0.66 ms |
+| FileStore 落盘（fsync+rename） | 55 次/秒 | 18 ms |
 
 结论：
 
 - 框架本身开销可忽略，**吞吐上限由 handler 的 IO 决定**
-- FileStore 逐事件落盘极慢（机械盘/云盘 fsync 代价），这正是默认「每 100 事件或 1 秒批量落盘」的原因
-- 追求极限吞吐时用 `StdoutHandler` 管道输出或 `RedisStreamHandler` pipeline，避免逐条落盘
+- `fsync` 默认关闭：云盘单次 fsync 约 18ms，是逐事件落盘慢的主因。关闭后崩溃最多丢最后一批点位，handler 幂等即可覆盖；需要更强持久性时设 `RELAY_FILE_FSYNC=1`
+- 追求极限吞吐时用 `StdoutHandler` 管道输出或 `RedisStreamHandler` pipeline
 
 ---
 

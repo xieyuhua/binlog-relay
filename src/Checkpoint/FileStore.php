@@ -14,11 +14,13 @@ final class FileStore implements StoreInterface
 {
     private string $path;
     private string $lockPath;
+    private bool $fsync;
 
-    public function __construct(string $path)
+    public function __construct(string $path, bool $fsync = false)
     {
         $this->path = $path;
         $this->lockPath = $path . '.lock';
+        $this->fsync = $fsync;
         $dir = dirname($path);
         if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
             throw new RuntimeException("点位目录创建失败：{$dir}");
@@ -50,14 +52,16 @@ final class FileStore implements StoreInterface
         if ($json === false) {
             throw new RuntimeException('点位序列化失败');
         }
-        // 先落临时文件并 fsync，再 rename 保证读侧永远看到完整内容
+        // 先落临时文件，再 rename 保证读侧永远看到完整内容。
+        // fsync 可选：默认关闭（云盘/机械盘上单次 fsync 约 17ms，是逐事件落盘慢的主因）；
+        // 崩溃最坏情况是最后一批点位回到上一次持久化的节点，handler 幂等即可覆盖。
         $fh = @fopen($tmp, 'wb');
         if ($fh === false) {
             throw new RuntimeException("点位文件写入失败：{$tmp}");
         }
         fwrite($fh, $json);
         fflush($fh);
-        if (function_exists('fsync')) {
+        if ($this->fsync && function_exists('fsync')) {
             @fsync($fh);
         }
         fclose($fh);

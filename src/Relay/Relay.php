@@ -174,7 +174,10 @@ final class Relay
             }
             $store = RedisStore::connect($cfg['redis'], (string)$cfg['key']);
         } else {
-            $store = new FileStore((string)$cfg['file']['path']);
+            $store = new FileStore(
+                (string)$cfg['file']['path'],
+                (bool)($cfg['file']['fsync'] ?? false)
+            );
         }
 
         return new PositionManager(

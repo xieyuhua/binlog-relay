@@ -28,7 +28,8 @@ function check(string $name, bool $ok): void
 
 $path = __DIR__ . '/../var/test-cp.json';
 @unlink($path);
-$store = new FileStore($path);
+$store = new FileStore($path);           // 默认不 fsync
+$storeDurable = new FileStore($path . '.dur', true);   // 强制 fsync 也要能正常写入
 $logger = new Logger('error');
 $pm = new PositionManager($store, $logger, 3, 0.2);
 
@@ -54,6 +55,13 @@ check('文件与位置正确', $saved->binlogFile === 'bin.000001' && $saved->bi
 $pm->flush();
 check('flush 后累计计数为 4', $store->load()->events === 4);
 $pm->unlock();
+
+// --- fsync 模式仍可正常落盘 ---
+$storeDurable->save(new BinlogRelay\Checkpoint\Checkpoint('bin.000002', '200', '', time(), 1, 'x'));
+$durable = $storeDurable->load();
+check('fsync 模式落盘正确', $durable !== null && $durable->binlogPos === '200');
+@unlink($path . '.dur');
+@unlink($path . '.dur.lock');
 
 // --- 过滤器 ---
 $f = Filter::fromConfig([

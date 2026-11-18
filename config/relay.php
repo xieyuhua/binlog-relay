@@ -52,6 +52,9 @@ return [
 
         'file' => [
             'path' => env('RELAY_FILE_PATH', __DIR__ . '/../var/checkpoint.json'),
+            // 是否对点位文件做 fsync。关闭（默认）时崩溃最多丢掉最后一批点位，
+            // handler 幂等即可；云盘上单次 fsync 约 17ms，逐事件落盘会被它拖死。
+            'fsync' => (bool)env('RELAY_FILE_FSYNC', false),
         ],
 
         // 每处理 N 个事件落一次点位（批量提交，显著减少 IO）
