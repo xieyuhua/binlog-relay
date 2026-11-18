@@ -1,0 +1,28 @@
+{
+  "name": "biaoge/binlog-relay",
+  "description": "Lightweight MySQL binlog relay framework in pure PHP, with Redis/file checkpointing and single-binary packaging.",
+  "type": "project",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.2",
+    "ext-sockets": "*",
+    "ext-bcmath": "*",
+    "ext-json": "*",
+    "krowinski/php-mysql-replication": "^9.0"
+  },
+  "suggest": {
+    "ext-redis": "Redis checkpoint backend",
+    "ext-pcntl": "Graceful SIGTERM/SIGINT shutdown on Linux/macOS"
+  },
+  "autoload": {
+    "psr-4": {
+      "BinlogRelay\\": "src/"
+    },
+    "files": ["src/Support/env.php"]
+  },
+  "config": {
+    "sort-packages": true,
+    "optimize-autoloader": true
+  },
+  "bin": ["bin/relay"]
+}

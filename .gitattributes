@@ -1,0 +1,14 @@
+* text=auto
+
+# 可执行脚本必须保持 LF，否则 Linux 上 shebang 失效
+bin/relay       text eol=lf
+build/build.sh  text eol=lf
+*.sh            text eol=lf
+
+*.php           text eol=lf
+composer.json   text eol=lf
+composer.lock   text eol=lf
+
+*.png binary
+*.jpg binary
+*.phar binary

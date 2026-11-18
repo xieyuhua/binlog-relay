@@ -1,0 +1,80 @@
+<?php
+/**
+ * binlog-relay 配置
+ *
+ * 所有值都可以用环境变量覆盖，便于容器化与打包后部署。
+ * 生产环境建议把密码放在环境变量里，不要提交到仓库。
+ */
+
+return [
+    // ---------- MySQL 主库（读取 binlog 的源） ----------
+    'mysql' => [
+        'host'     => env('RELAY_MYSQL_HOST', '127.0.0.1'),
+        'port'     => (int) env('RELAY_MYSQL_PORT', 3306),
+        'user'     => env('RELAY_MYSQL_USER', 'repl'),
+        'password' => env('RELAY_MYSQL_PASSWORD', ''),
+        'charset'  => env('RELAY_MYSQL_CHARSET', 'utf8mb4'),
+
+        // 从库身份，必须全局唯一（0~2^32-1）
+        'slave_id' => (int) env('RELAY_SLAVE_ID', 8811),
+
+        // 心跳：秒，0 表示关闭。建议 30，空闲时保活
+        'heartbeat' => (float) env('RELAY_HEARTBEAT', 30),
+
+        // 表结构缓存条数
+        'table_cache_size' => (int) env('RELAY_TABLE_CACHE', 256),
+    ],
+
+    // ---------- 订阅范围 ----------
+    'filter' => [
+        // 为空表示不过滤
+        'databases' => csv(env('RELAY_DATABASES', '')),
+        'tables'    => csv(env('RELAY_TABLES', '')),
+        'ignore_databases' => csv(env('RELAY_IGNORE_DATABASES', 'mysql,sys,information_schema,performance_schema')),
+        'ignore_tables'    => csv(env('RELAY_IGNORE_TABLES', '')),
+    ],
+
+    // ---------- 点位存储 ----------
+    // driver: redis | file
+    'checkpoint' => [
+        'driver' => env('RELAY_CHECKPOINT', 'file'),
+
+        // 同一个 key 上一个进程独占，避免两个实例同时消费产生重复
+        'key' => env('RELAY_CHECKPOINT_KEY', 'binlog_relay:checkpoint:default'),
+
+        'redis' => [
+            'host'     => env('RELAY_REDIS_HOST', '127.0.0.1'),
+            'port'     => (int) env('RELAY_REDIS_PORT', 6379),
+            'password' => env('RELAY_REDIS_PASSWORD', ''),
+            'database' => (int) env('RELAY_REDIS_DB', 0),
+            'timeout'  => 2.0,
+        ],
+
+        'file' => [
+            'path' => env('RELAY_FILE_PATH', __DIR__ . '/../var/checkpoint.json'),
+        ],
+
+        // 每处理 N 个事件落一次点位（批量提交，显著减少 IO）
+        'every_events' => (int) env('RELAY_CHECKPOINT_EVERY', 100),
+        // 或者每隔 N 秒落一次（两者先到先触发）
+        'every_seconds' => (float) env('RELAY_CHECKPOINT_SECONDS', 1.0),
+    ],
+
+    // ---------- 输出 / 处理器 ----------
+    'handlers' => [
+        // 顺序执行。内置：stdout（JSON Lines 打到标准输出）
+        // 自定义处理器写全类名，需实现 BinlogRelay\Handler\HandlerInterface
+        BinlogRelay\Handler\StdoutHandler::class,
+    ],
+
+    // 每批多少条事件交给 handler（单条事件可能含多行变更）
+    'batch_size' => (int) env('RELAY_BATCH_SIZE', 200),
+
+    // ---------- 日志 ----------
+    'log' => [
+        'level' => env('RELAY_LOG_LEVEL', 'info'),   // debug|info|warn|error
+        'file'  => env('RELAY_LOG_FILE', ''),        // 为空则打到 stderr
+    ],
+
+    'timezone' => 'Asia/Shanghai',
+];

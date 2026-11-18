@@ -1,0 +1,10 @@
+/vendor/
+/.env
+/var/*.json
+/var/*.log
+/var/*.jsonl
+/var/*.lock
+/var/*.txt
+/var/*.php
+/dist/
+/build/micro.sfx

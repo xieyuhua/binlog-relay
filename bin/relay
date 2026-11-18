@@ -1,0 +1,299 @@
+#!/usr/bin/env php
+<?php
+/**
+ * binlog-relay 入口
+ *
+ *   relay start                 启动消费
+ *   relay status                查看点位
+ *   relay reset-position        删除点位（从最新位置重新开始）
+ *   relay once --seconds=5      消费 N 秒后退出（调试用）
+ */
+
+declare(strict_types=1);
+
+// 源码运行时脚本在 bin/ 下；phar 内 relay.php 位于包根
+define('RELAY_ROOT', str_starts_with(__FILE__, 'phar://') ? __DIR__ : dirname(__DIR__));
+
+$autoload = RELAY_ROOT . '/vendor/autoload.php';
+if (!is_file($autoload)) {
+    fwrite(STDERR, "找不到 vendor/autoload.php，请先 composer install\n");
+    exit(1);
+}
+require $autoload;   // env() 由 composer autoload files 加载
+
+use BinlogRelay\Checkpoint\FileStore;
+use BinlogRelay\Checkpoint\RedisStore;
+use BinlogRelay\Relay\Relay;
+
+/** 打包为 phar / micro 后 __DIR__ 指向包内，配置需从 CWD 或环境变量读取 */
+$configFile = getenv('RELAY_CONFIG') ?: '';
+if ($configFile === '' && is_file(getcwd() . '/config/relay.php')) {
+    $configFile = getcwd() . '/config/relay.php';
+}
+if ($configFile === '' && is_file(RELAY_ROOT . '/config/relay.php')) {
+    $configFile = RELAY_ROOT . '/config/relay.php';
+}
+if ($configFile === '' || !is_file($configFile)) {
+    fwrite(STDERR, "找不到配置文件 config/relay.php，可用 RELAY_CONFIG 指定路径\n");
+    exit(1);
+}
+
+$config = require $configFile;
+date_default_timezone_set($config['timezone'] ?? 'Asia/Shanghai');
+
+$argv = $_SERVER['argv'] ?? [];
+array_shift($argv);
+$command = $argv[0] ?? 'start';
+$options = parse_options(array_slice($argv, 1));
+
+switch ($command) {
+    case 'start':
+        cmd_start($config, $options);
+        break;
+
+    case 'once':
+        cmd_once($config, $options);
+        break;
+
+    case 'status':
+        cmd_status($config);
+        break;
+
+    case 'reset-position':
+        cmd_reset($config, $options);
+        break;
+
+    case 'check':
+        cmd_check($config);
+        break;
+
+    case 'help':
+    case '--help':
+    case '-h':
+        usage();
+        break;
+
+    default:
+        fwrite(STDERR, "未知命令：{$command}\n\n");
+        usage();
+        exit(1);
+}
+
+/* ===================== 命令 ===================== */
+
+function cmd_start(array $config, array $options): void
+{
+    $relay = new Relay($config);
+    $relay->boot();
+    install_signals($relay);
+
+    try {
+        $relay->run();
+    } finally {
+        // 把最后累积的点位落盘（handler 已完成的那部分）
+        $relay->positionManager()->flush();
+        $relay->positionManager()->unlock();
+    }
+    $relay->logger()->info('relay 已停止');
+}
+
+/** 消费固定时长后退出，用于联调 */
+function cmd_once(array $config, array $options): void
+{
+    $seconds = (float)($options['seconds'] ?? 5);
+    $config['mysql']['heartbeat'] = min((float)($config['mysql']['heartbeat'] ?? 30), 1);
+
+    $relay = new Relay($config);
+    $relay->boot();
+    install_signals($relay);
+
+    $relay->logger()->info("once 模式：消费 {$seconds} 秒");
+    try {
+        $relay->runUntil(microtime(true) + $seconds);
+    } finally {
+        $relay->positionManager()->flush();
+        $relay->positionManager()->unlock();
+    }
+}
+
+function cmd_status(array $config): void
+{
+    $relay = new Relay($config);
+    $store = make_store($config);
+    $cp = $store->load();
+    if ($cp === null) {
+        echo "尚无点位（首次启动将从最新 binlog 末尾开始）\n";
+        echo '存储后端：' . $store->name() . "\n";
+        return;
+    }
+    echo "存储后端：{$store->name()}\n";
+    if ($cp->isGtidMode()) {
+        echo "GTID：{$cp->gtid}\n";
+    }
+    echo "binlog：{$cp->binlogFile}:{$cp->binlogPos}\n";
+    echo '最后更新：' . ($cp->updatedAt ? date('Y-m-d H:i:s', $cp->updatedAt) : '-') . "\n";
+    echo "累计事件：{$cp->events}\n";
+    echo "持有者：{$cp->owner}\n";
+}
+
+function cmd_reset(array $config, array $options): void
+{
+    $store = make_store($config);
+    $cp = $store->load();
+    if ($cp !== null && !isset($options['force'])) {
+        fwrite(STDERR, "点位存在（{$cp->binlogFile}:{$cp->binlogPos}），确认重置请加 --force\n");
+        exit(2);
+    }
+    // 先抢锁，避免正在运行的 relay 把点位又写回来
+    $owner = 'reset:' . getmypid();
+    if (!$store->acquireLock($owner, 10)) {
+        fwrite(STDERR, "relay 正在运行并持有锁，请先停止进程再重置\n");
+        exit(3);
+    }
+    $store->save(new \BinlogRelay\Checkpoint\Checkpoint());
+    $store->releaseLock($owner);
+    echo "点位已重置\n";
+}
+
+/** 连通性与配置自检（部署后先跑这个） */
+function cmd_check(array $config): void
+{
+    $ok = true;
+    $mysql = $config['mysql'];
+
+    // 1. MySQL 连接与 binlog 配置
+    try {
+        $pdo = new PDO(
+            sprintf('mysql:host=%s;port=%d;charset=utf8mb4', $mysql['host'], $mysql['port']),
+            $mysql['user'],
+            $mysql['password'],
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5]
+        );
+        echo "[OK] MySQL 连接成功\n";
+
+        $vars = [];
+        foreach ($pdo->query("SHOW GLOBAL VARIABLES WHERE Variable_name IN
+            ('binlog_format','binlog_row_image','log_bin','server_id','binlog_row_metadata')") as $row) {
+            $vars[$row['Variable_name']] = $row['Value'];
+        }
+        $expect = [
+            'log_bin' => 'ON',
+            'binlog_format' => 'ROW',
+            'binlog_row_image' => 'FULL',
+        ];
+        foreach ($expect as $k => $v) {
+            $actual = strtoupper((string)($vars[$k] ?? ''));
+            if ($actual !== $v) {
+                echo "[FAIL] {$k}={$actual}，应为 {$v}\n";
+                $ok = false;
+            } else {
+                echo "[OK] {$k}={$actual}\n";
+            }
+        }
+        if (isset($vars['binlog_row_metadata'])) {
+            $meta = strtoupper((string)$vars['binlog_row_metadata']);
+            echo ($meta === 'FULL' ? '[OK] ' : '[WARN] ') . "binlog_row_metadata={$meta}"
+                . ($meta === 'FULL' ? "\n" : "（建议 FULL，否则每张表首次出现要查 information_schema）\n");
+        }
+
+        $grants = $pdo->query('SHOW GRANTS')->fetchAll(PDO::FETCH_COLUMN);
+        $hasRepl = false;
+        foreach ($grants as $g) {
+            if (stripos($g, 'REPLICATION SLAVE') !== false || stripos($g, 'REPLICATION CLIENT') !== false) {
+                $hasRepl = true;
+            }
+        }
+        echo ($hasRepl ? '[OK] ' : '[FAIL] ') . "复制权限\n";
+        $ok = $ok && $hasRepl;
+    } catch (Throwable $e) {
+        echo '[FAIL] MySQL 连接失败：' . $e->getMessage() . "\n";
+        $ok = false;
+    }
+
+    // 2. 点位存储
+    try {
+        $store = make_store($config);
+        $store->load();
+        echo '[OK] 点位存储可用：' . $store->name() . "\n";
+    } catch (Throwable $e) {
+        echo '[FAIL] 点位存储不可用：' . $e->getMessage() . "\n";
+        $ok = false;
+    }
+
+    // 3. 处理器
+    foreach ($config['handlers'] ?? [] as $spec) {
+        if (is_string($spec) && !class_exists($spec)) {
+            echo "[FAIL] 处理器不存在：{$spec}\n";
+            $ok = false;
+        }
+    }
+
+    echo $ok ? "\n自检通过\n" : "\n自检未通过，请修复上面的 FAIL 项\n";
+    exit($ok ? 0 : 1);
+}
+
+/* ===================== 工具 ===================== */
+
+function make_store(array $config): \BinlogRelay\Checkpoint\StoreInterface
+{
+    $cfg = $config['checkpoint'];
+    if (($cfg['driver'] ?? 'file') === 'redis') {
+        return RedisStore::connect($cfg['redis'], (string)$cfg['key']);
+    }
+    return new FileStore((string)$cfg['file']['path']);
+}
+
+/** 注册信号：SIGTERM / SIGINT 只置标记，让当前批次处理完再退出 */
+function install_signals(Relay $relay): void
+{
+    if (!function_exists('pcntl_signal')) {
+        return;
+    }
+    $handler = function () use ($relay) {
+        $relay->logger()->info('收到停止信号，处理完当前批次后退出…');
+        $relay->stop();
+    };
+    pcntl_signal(SIGTERM, $handler);
+    pcntl_signal(SIGINT, $handler);
+    pcntl_async_signals(true);
+}
+
+function parse_options(array $args): array
+{
+    $out = [];
+    foreach ($args as $a) {
+        if (str_starts_with($a, '--')) {
+            $a = substr($a, 2);
+            if (str_contains($a, '=')) {
+                [$k, $v] = explode('=', $a, 2);
+                $out[$k] = $v;
+            } else {
+                $out[$a] = true;
+            }
+        }
+    }
+    return $out;
+}
+
+function usage(): void
+{
+    echo <<<TXT
+binlog-relay · MySQL binlog 轻量中继
+
+用法：
+  relay start                 启动消费（Ctrl+C / SIGTERM 优雅退出）
+  relay once --seconds=5      消费指定秒数后退出，用于联调
+  relay status                查看当前点位
+  relay reset-position --force 清空点位（重新从最新 binlog 开始）
+  relay check                 部署自检：MySQL / binlog / 权限 / 点位存储
+
+环境变量：
+  RELAY_CONFIG            配置文件路径（默认 ./config/relay.php）
+  RELAY_MYSQL_HOST        主库地址
+  RELAY_MYSQL_USER        复制账号
+  RELAY_MYSQL_PASSWORD    复制账号密码
+  RELAY_CHECKPOINT        file | redis
+  RELAY_LOG_LEVEL         debug | info | warn | error
+
+TXT;
+}
