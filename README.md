@@ -977,3 +977,123 @@ RELAY_ONLY_CONFIGURED=1 php bin/relay start
 - 开启后如果 `tables` 和 `columns` 都为空，等于**丢弃所有表**（配置里已注明，`relay check` 不会自动拦截，请自行确认）
 - 新上线的表如果业务需要，记得同时加进 `tables` 或 `columns`，否则会被静默丢弃
 - 与 `ignore_tables` 同时配置时，忽略规则优先
+
+---
+
+## 20. 零依赖单体：`bin/binlog2redis`
+
+如果你只想要一件事——**读 binlog，按配置过滤，写 Redis**——用这个入口。
+它把 binlog 解析库完整内嵌进项目，不需要 Composer，不需要 vendor 目录。
+
+### 20.1 为什么可以不要 vendor
+
+原依赖 krowinski/php-mysql-replication 共 80 个文件、7157 行，外部依赖只有 5 个，
+且用法都很浅，已全部用内置实现替换：
+
+| 原依赖 | 用途 | 替换方案 |
+|---|---|---|
+| `doctrine/dbal` | MySQL 连接、查 information_schema | `src/Replication/Support/PdoConnection.php`（PDO） |
+| `doctrine/collections` | 3 个 Collection 类 | `src/Replication/Support/Collection.php` |
+| `symfony/event-dispatcher` | 事件分发 | `src/Replication/Support/EventDispatcher.php` |
+| `psr/log` | 日志接口 | `src/Replication/Support/LoggerInterface.php` |
+| `psr/simple-cache` | 表结构缓存接口 | `src/Replication/Support/CacheInterface.php` |
+
+命名空间从 `MySQLReplication\` 改为 `BinlogRelay\Replication\`，与项目统一。
+`src/bootstrap.php` 是一个 40 行的 PSR-4 自动加载器，**存在 vendor 时优先用 composer，
+不存在时自动回退到内置加载**，两种方式都不用改代码。
+
+### 20.2 目录
+
+```
+src/Replication/         内嵌的 binlog 解析器（63 个文件）
+src/Standalone/          单体服务组件
+  StreamWriter.php       Change[] → XADD（pipeline）
+  RelaySubscriber.php    过滤 → 归一化 → 裁剪 → 攒批
+  Runner.php             装配 MySQLReplicationFactory
+src/bootstrap.php        零依赖自动加载器
+bin/binlog2redis         单文件入口
+config/binlog2redis.php  配置
+```
+
+### 20.3 运行
+
+```bash
+# 不需要 composer install
+php bin/binlog2redis check          # 自检 MySQL / Redis / 点位
+php bin/binlog2redis start          # 前台运行
+php bin/binlog2redis status         # 查看点位
+```
+
+依赖只有 PHP 扩展：`sockets`（binlog 协议）、`bcmath`、`json`、`redis`、`pdo_mysql`。
+
+### 20.4 最小配置
+
+```php
+// config/binlog2redis.php
+return [
+    'mysql' => [
+        'host' => '127.0.0.1', 'port' => 3306,
+        'user' => 'repl', 'password' => '***',
+        'slave_id' => 8811,          // 集群内唯一
+    ],
+    'filter' => [
+        'databases' => ['shop'],
+        'only_configured' => true,   // 只处理下面出现的表
+        'columns' => [
+            'orders' => ['id', 'status', 'amount'],   // 其余列丢弃
+        ],
+    ],
+    'redis' => [
+        'host' => '127.0.0.1', 'port' => 6379,
+        'stream' => 'binlog:events',
+    ],
+    'checkpoint' => [
+        'driver' => 'redis',         // 或 file
+        'key' => 'relay:shop',
+    ],
+];
+```
+
+全部配置项都可以用环境变量覆盖，详见 `config/binlog2redis.php` 注释。
+
+### 20.5 实测（MySQL 5.7 + 内嵌解析器）
+
+已在真实 binlog 上验证：
+
+```
+insert demo.orders:333   ✅ 行数据完整（含 TEXT 字段）
+update demo.orders:333   ✅ before/after 都正确
+delete demo.orders:333   ✅
+```
+
+列裁剪 + 多 topic 扇出同时验证：
+
+```
+配置：columns.orders = [id, status]
+      topics = [topic:order (全部), topic:audit (仅 delete)]
+结果：
+  topic:order  insert  row={'id':444,'status':'new'}   ← note 已被裁掉
+  topic:order  delete  row={'id':444,'status':'new'}
+  topic:audit  delete  row={'id':444,'status':'new'}   ← 只收 delete
+```
+
+### 20.6 与完整框架的关系
+
+| | `bin/binlog2redis` | `bin/relay` + `bin/consumer` |
+|---|---|---|
+| 依赖 | 零依赖 | 零依赖（同样内置） |
+| 输出 | 仅 Redis Stream | Redis Stream / HTTP / TCP / MySQL / CK / ES |
+| 层级 | 生产端+入队合一 | 生产端与消费端分离 |
+| 适用 | 只要 binlog → Redis | 需要多下游、多消费组 |
+
+两者共用同一套 `src/Replication`、`EventBuilder`、`ColumnProjector`、`Filter`，
+行为一致，可以先用单体跑通再迁移到完整框架。
+
+### 20.7 打包为单文件
+
+```bash
+# 加入打包脚本（复用同一 micro.sfx）
+./build/build.sh all
+# 手动打包单体入口：
+php -d phar.readonly=0 build/make-phar.php dist/stage-binlog2redis dist/binlog2redis.phar binlog2redis
+```

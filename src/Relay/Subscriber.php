@@ -10,10 +10,10 @@ use BinlogRelay\Event\EventBuilder;
 use BinlogRelay\Event\Filter;
 use BinlogRelay\Handler\HandlerChain;
 use BinlogRelay\Support\Logger;
-use MySQLReplication\Definitions\ConstEventsNames;
-use MySQLReplication\Event\DTO\EventDTO;
-use MySQLReplication\Event\DTO\RowsDTO;
-use MySQLReplication\Event\EventSubscribers;
+use BinlogRelay\Replication\Definitions\ConstEventsNames;
+use BinlogRelay\Replication\Event\DTO\EventDTO;
+use BinlogRelay\Replication\Event\DTO\RowsDTO;
+use BinlogRelay\Replication\Event\EventSubscribers;
 
 /**
  * 事件订阅入口：只处理行变更，其余事件仅用于维护点位
@@ -55,17 +55,17 @@ final class Subscriber extends EventSubscribers
         ];
     }
 
-    public function onWrite(\MySQLReplication\Event\DTO\WriteRowsDTO $event): void
+    public function onWrite(\BinlogRelay\Replication\Event\DTO\WriteRowsDTO $event): void
     {
         $this->ingest($event);
     }
 
-    public function onUpdate(\MySQLReplication\Event\DTO\UpdateRowsDTO $event): void
+    public function onUpdate(\BinlogRelay\Replication\Event\DTO\UpdateRowsDTO $event): void
     {
         $this->ingest($event);
     }
 
-    public function onDelete(\MySQLReplication\Event\DTO\DeleteRowsDTO $event): void
+    public function onDelete(\BinlogRelay\Replication\Event\DTO\DeleteRowsDTO $event): void
     {
         $this->ingest($event);
     }

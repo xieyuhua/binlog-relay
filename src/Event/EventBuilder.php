@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace BinlogRelay\Event;
 
-use MySQLReplication\Event\DTO\DeleteRowsDTO;
-use MySQLReplication\Event\DTO\RowsDTO;
-use MySQLReplication\Event\DTO\UpdateRowsDTO;
-use MySQLReplication\BinLog\BinLogCurrent;
-use MySQLReplication\Event\DTO\WriteRowsDTO;
-use MySQLReplication\Event\RowEvent\TableMap;
+use BinlogRelay\Replication\Event\DTO\DeleteRowsDTO;
+use BinlogRelay\Replication\Event\DTO\RowsDTO;
+use BinlogRelay\Replication\Event\DTO\UpdateRowsDTO;
+use BinlogRelay\Replication\BinLog\BinLogCurrent;
+use BinlogRelay\Replication\Event\DTO\WriteRowsDTO;
+use BinlogRelay\Replication\Event\RowEvent\TableMap;
 
 /**
  * 把 php-mysql-replication 的 RowsDTO 归一化为 Change[]

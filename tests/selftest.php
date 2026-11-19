@@ -7,14 +7,14 @@
 
 declare(strict_types=1);
 
-require __DIR__ . '/../vendor/autoload.php';   // env() 由 composer autoload files 加载
+require __DIR__ . '/../src/bootstrap.php';   // env() 由 composer autoload files 加载
 
 use BinlogRelay\Checkpoint\{FileStore, PositionManager};
 use BinlogRelay\Event\Change;
 use BinlogRelay\Event\Filter;
 use BinlogRelay\Handler\{HandlerChain, HandlerInterface};
 use BinlogRelay\Support\Logger;
-use MySQLReplication\BinLog\BinLogCurrent;
+use BinlogRelay\Replication\BinLog\BinLogCurrent;
 
 $failed = 0;
 function check(string $name, bool $ok): void

@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace BinlogRelay\Checkpoint;
 
 use BinlogRelay\Support\Logger;
-use MySQLReplication\BinLog\BinLogCurrent;
+use BinlogRelay\Replication\BinLog\BinLogCurrent;
 
 /**
  * 点位管理：内存累积 → 按事件数/时间批量落盘（写放大降一个数量级）

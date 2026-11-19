@@ -12,9 +12,9 @@ use BinlogRelay\Event\ColumnProjector;
 use BinlogRelay\Event\Filter;
 use BinlogRelay\Handler\HandlerChain;
 use BinlogRelay\Support\Logger;
-use MySQLReplication\Config\ConfigBuilder;
-use MySQLReplication\Definitions\ConstEventType;
-use MySQLReplication\MySQLReplicationFactory;
+use BinlogRelay\Replication\Config\ConfigBuilder;
+use BinlogRelay\Replication\Definitions\ConstEventType;
+use BinlogRelay\Replication\MySQLReplicationFactory;
 use RuntimeException;
 
 /**

@@ -1,0 +1,332 @@
+#!/usr/bin/env php
+<?php
+/**
+ * binlog2redis —— 单文件 binlog → Redis Stream 服务
+ *
+ * 只做一件事：连上 MySQL 读 binlog → 按配置过滤表/列 → 写 Redis Stream
+ *
+ * 特性：
+ * - 零 Composer 依赖（内嵌 binlog 解析器，见 src/Replication）
+ * - 单文件可执行：php binlog2redis start
+ * - 点位可存 Redis 或文件，支持崩溃后续传
+ * - 同一事件可按规则扇出到多个 topic
+ *
+ * 用法：
+ *   binlog2redis start                 启动（Ctrl+C / SIGTERM 优雅退出）
+ *   binlog2redis once --seconds=5      消费指定秒数后退出
+ *   binlog2redis status                查看点位
+ *   binlog2redis reset-position --force 重置点位
+ *   binlog2redis check                 连通性自检
+ *
+ * 配置：默认读 ./config/binlog2redis.php，可用 RELAY_CONFIG 指定。
+ */
+
+declare(strict_types=1);
+
+define('RELAY_ROOT', str_starts_with(__FILE__, 'phar://') ? __DIR__ : dirname(__DIR__));
+
+require RELAY_ROOT . '/src/bootstrap.php';
+
+use BinlogRelay\Checkpoint\Checkpoint;
+use BinlogRelay\Checkpoint\FileStore;
+use BinlogRelay\Checkpoint\PositionManager;
+use BinlogRelay\Checkpoint\RedisStore;
+use BinlogRelay\Checkpoint\StoreInterface;
+use BinlogRelay\Event\ColumnProjector;
+use BinlogRelay\Event\Filter;
+use BinlogRelay\Standalone\RelaySubscriber;
+use BinlogRelay\Standalone\Runner;
+use BinlogRelay\Standalone\StreamWriter;
+use BinlogRelay\Support\Logger;
+
+$config = load_config();
+date_default_timezone_set($config['timezone'] ?? 'Asia/Shanghai');
+
+$argv = $_SERVER['argv'] ?? [];
+array_shift($argv);
+$command = $argv[0] ?? 'start';
+$options = parse_options(array_slice($argv, 1));
+
+try {
+    switch ($command) {
+        case 'start':
+        case 'once':
+            run_service($config, $command, $options);
+            break;
+        case 'status':
+            show_status($config);
+            break;
+        case 'reset-position':
+            reset_position($config, $options);
+            break;
+        case 'check':
+            exit(run_check($config));
+        case 'help':
+        case '--help':
+        case '-h':
+            usage();
+            break;
+        default:
+            fwrite(STDERR, "未知命令：{$command}\n\n");
+            usage();
+            exit(1);
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, '错误：' . $e->getMessage() . PHP_EOL);
+    exit(1);
+}
+
+/* ===================== 命令 ===================== */
+
+function run_service(array $config, string $command, array $options): void
+{
+    $logger = make_logger($config);
+    $positions = make_positions(make_store($config), $logger, $config);
+    $positions->lock();
+
+    $writer = new StreamWriter($config, $logger);
+    $writer->boot();
+
+    $subscriber = new RelaySubscriber(
+        $writer,
+        Filter::fromConfig($config['filter'] ?? []),
+        $positions,
+        $logger,
+        (int)($config['batch_size'] ?? 200),
+        make_projector($config, $logger)
+    );
+
+    $deadline = $command === 'once'
+        ? microtime(true) + (float)($options['seconds'] ?? 5)
+        : null;
+
+    $runner = new Runner($config, $logger, $positions, $subscriber);
+    install_signals($runner);
+
+    try {
+        $runner->run($deadline);
+    } finally {
+        $positions->flush();
+        $positions->unlock();
+    }
+}
+
+function show_status(array $config): void
+{
+    $store = make_store($config);
+    $cp = $store->load();
+    printf("存储后端：%s\n", $store->name());
+    if ($cp === null) {
+        echo "尚无点位（将从最新 binlog 末尾开始）\n";
+        return;
+    }
+    if ($cp->isGtidMode()) {
+        printf("GTID：%s\n", $cp->gtid);
+    }
+    printf("binlog：%s:%s\n", $cp->binlogFile, $cp->binlogPos);
+    printf("累计事件：%d\n", $cp->events);
+    printf("最后更新：%s\n", $cp->updatedAt ? date('Y-m-d H:i:s', $cp->updatedAt) : '-');
+}
+
+function reset_position(array $config, array $options): void
+{
+    $store = make_store($config);
+    $cp = $store->load();
+    if ($cp !== null && !isset($options['force'])) {
+        fwrite(STDERR, "点位存在（{$cp->binlogFile}:{$cp->binlogPos}），确认重置请加 --force\n");
+        exit(2);
+    }
+    $owner = 'reset:' . getmypid();
+    if (!$store->acquireLock($owner, 10)) {
+        fwrite(STDERR, "服务正在运行并持有锁，请先停止\n");
+        exit(3);
+    }
+    $store->save(new Checkpoint());
+    $store->releaseLock($owner);
+    echo "点位已重置\n";
+}
+
+function run_check(array $config): int
+{
+    $ok = true;
+    $mysql = $config['mysql'];
+
+    try {
+        $pdo = new PDO(
+            sprintf('mysql:host=%s;port=%d;charset=utf8mb4', $mysql['host'], $mysql['port']),
+            $mysql['user'],
+            $mysql['password'],
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5]
+        );
+        echo "[OK] MySQL 连接成功\n";
+
+        $vars = [];
+        foreach ($pdo->query("SHOW GLOBAL VARIABLES WHERE Variable_name IN
+            ('binlog_format','binlog_row_image','log_bin')") as $row) {
+            $vars[$row['Variable_name']] = $row['Value'];
+        }
+        foreach (['log_bin' => 'ON', 'binlog_format' => 'ROW', 'binlog_row_image' => 'FULL'] as $k => $want) {
+            $got = strtoupper((string)($vars[$k] ?? ''));
+            echo ($got === $want ? '[OK] ' : '[FAIL] ') . "{$k}={$got}\n";
+            $ok = $ok && $got === $want;
+        }
+        $hasRepl = false;
+        foreach ($pdo->query('SHOW GRANTS')->fetchAll(PDO::FETCH_COLUMN) as $g) {
+            if (stripos($g, 'REPLICATION') !== false) {
+                $hasRepl = true;
+            }
+        }
+        echo ($hasRepl ? '[OK] ' : '[FAIL] ') . "复制权限\n";
+        $ok = $ok && $hasRepl;
+    } catch (Throwable $e) {
+        echo '[FAIL] MySQL：' . $e->getMessage() . "\n";
+        $ok = false;
+    }
+
+    try {
+        $store = make_store($config);
+        $store->load();
+        echo '[OK] 点位存储：' . $store->name() . "\n";
+    } catch (Throwable $e) {
+        echo '[FAIL] 点位存储：' . $e->getMessage() . "\n";
+        $ok = false;
+    }
+
+    try {
+        $cfg = $config['redis'];
+        $r = new Redis();
+        $r->connect((string)$cfg['host'], (int)$cfg['port'], 2.0);
+        if ((string)($cfg['password'] ?? '') !== '') {
+            $r->auth((string)$cfg['password']);
+        }
+        $r->ping();
+        echo "[OK] Redis 连接成功\n";
+        $topics = $cfg['topics'] ?? [['stream' => $cfg['stream'] ?? 'binlog:events']];
+        echo '[OK] 写入目标：' . implode(', ', array_column($topics, 'stream')) . "\n";
+    } catch (Throwable $e) {
+        echo '[FAIL] Redis：' . $e->getMessage() . "\n";
+        $ok = false;
+    }
+
+    echo $ok ? "\n自检通过\n" : "\n自检未通过\n";
+    return $ok ? 0 : 1;
+}
+
+/* ===================== 配置与工具 ===================== */
+
+function load_config(): array
+{
+    $file = getenv('RELAY_CONFIG') ?: '';
+    if ($file === '' && is_file(getcwd() . '/config/binlog2redis.php')) {
+        $file = getcwd() . '/config/binlog2redis.php';
+    }
+    if ($file === '' && is_file(RELAY_ROOT . '/config/binlog2redis.php')) {
+        $file = RELAY_ROOT . '/config/binlog2redis.php';
+    }
+    if ($file === '' || !is_file($file)) {
+        fwrite(STDERR, "找不到配置 config/binlog2redis.php，可用 RELAY_CONFIG 指定\n");
+        exit(1);
+    }
+    return require $file;
+}
+
+function make_logger(array $config): Logger
+{
+    return new Logger(
+        (string)($config['log']['level'] ?? 'info'),
+        (string)($config['log']['file'] ?? '')
+    );
+}
+
+function make_store(array $config): StoreInterface
+{
+    $cfg = $config['checkpoint'];
+    if (($cfg['driver'] ?? 'file') === 'redis') {
+        return RedisStore::connect($cfg['redis'], (string)$cfg['key']);
+    }
+    return new FileStore((string)$cfg['file']['path'], (bool)($cfg['file']['fsync'] ?? false));
+}
+
+function make_positions(StoreInterface $store, Logger $logger, array $config): PositionManager
+{
+    $cfg = $config['checkpoint'];
+    return new PositionManager(
+        $store,
+        $logger,
+        (int)($cfg['every_events'] ?? 100),
+        (float)($cfg['every_seconds'] ?? 1.0)
+    );
+}
+
+function make_projector(array $config, Logger $logger): ?ColumnProjector
+{
+    $cols = $config['filter']['columns'] ?? [];
+    if (!is_array($cols) || $cols === []) {
+        return null;
+    }
+    $logger->info('列裁剪已启用，配置表数：' . count($cols));
+    return ColumnProjector::fromConfig($cols);
+}
+
+function install_signals(object $runner): void
+{
+    if (!function_exists('pcntl_signal')) {
+        return;
+    }
+    $handler = static function () use ($runner) {
+        $runner->stop();
+    };
+    pcntl_signal(SIGTERM, $handler);
+    pcntl_signal(SIGINT, $handler);
+    pcntl_async_signals(true);
+}
+
+function parse_options(array $args): array
+{
+    $out = [];
+    foreach ($args as $a) {
+        if (str_starts_with($a, '--')) {
+            $a = substr($a, 2);
+            if (str_contains($a, '=')) {
+                [$k, $v] = explode('=', $a, 2);
+                $out[$k] = $v;
+            } else {
+                $out[$a] = true;
+            }
+        }
+    }
+    return $out;
+}
+
+function usage(): void
+{
+    echo <<<TXT
+binlog2redis · binlog → Redis Stream 单文件服务
+
+用法：
+  binlog2redis start                    启动（Ctrl+C / SIGTERM 优雅退出）
+  binlog2redis once --seconds=5         消费指定秒数后退出
+  binlog2redis status                   查看点位
+  binlog2redis reset-position --force   重置点位
+  binlog2redis check                    MySQL / Redis / 点位 自检
+
+配置：
+  RELAY_CONFIG            配置文件路径，默认 ./config/binlog2redis.php
+
+环境变量（覆盖配置）：
+  RELAY_MYSQL_HOST / RELAY_MYSQL_PORT / RELAY_MYSQL_USER / RELAY_MYSQL_PASSWORD
+  RELAY_SLAVE_ID          从库 ID，集群内必须唯一
+  RELAY_DATABASES         只订阅的库，逗号分隔
+  RELAY_TABLES            只订阅的表
+  RELAY_ONLY_CONFIGURED   1 = 只处理 tables/columns 里配置过的表
+  RELAY_REDIS_HOST / RELAY_REDIS_PORT / RELAY_REDIS_PASSWORD / RELAY_REDIS_DB
+  RELAY_STREAM            目标 stream，默认 binlog:events
+  RELAY_CHECKPOINT        file | redis
+  RELAY_LOG_LEVEL         debug | info | warning | error
+
+依赖：
+  PHP 8.2+，扩展 sockets / bcmath / json / redis / pdo_mysql
+  不需要 composer，也不需要 vendor 目录
+
+TXT;
+}

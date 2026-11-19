@@ -14,12 +14,8 @@ declare(strict_types=1);
 // 源码运行时脚本在 bin/ 下；phar 内 relay.php 位于包根
 define('RELAY_ROOT', str_starts_with(__FILE__, 'phar://') ? __DIR__ : dirname(__DIR__));
 
-$autoload = RELAY_ROOT . '/vendor/autoload.php';
-if (!is_file($autoload)) {
-    fwrite(STDERR, "找不到 vendor/autoload.php，请先 composer install\n");
-    exit(1);
-}
-require $autoload;   // env() 由 composer autoload files 加载
+// 零依赖自动加载：有 vendor 时用 composer，没有则用内置 PSR-4（无需 composer install）
+require RELAY_ROOT . '/src/bootstrap.php';
 
 use BinlogRelay\Checkpoint\FileStore;
 use BinlogRelay\Checkpoint\RedisStore;

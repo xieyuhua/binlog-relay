@@ -16,7 +16,7 @@
 
 declare(strict_types=1);
 
-require __DIR__ . '/../vendor/autoload.php';
+require __DIR__ . '/../src/bootstrap.php';
 
 use BinlogRelay\Checkpoint\FileStore;
 use BinlogRelay\Checkpoint\PositionManager;
@@ -24,12 +24,12 @@ use BinlogRelay\Event\EventBuilder;
 use BinlogRelay\Handler\HandlerChain;
 use BinlogRelay\Handler\HandlerInterface;
 use BinlogRelay\Support\Logger;
-use MySQLReplication\BinLog\BinLogCurrent;
-use MySQLReplication\Definitions\{ConstEventType, ConstFieldType};
-use MySQLReplication\Event\DTO\WriteRowsDTO;
-use MySQLReplication\Event\EventInfo;
-use MySQLReplication\Event\RowEvent\{ColumnDTO, ColumnDTOCollection, TableMap};
-use MySQLReplication\Repository\FieldDTO;
+use BinlogRelay\Replication\BinLog\BinLogCurrent;
+use BinlogRelay\Replication\Definitions\{ConstEventType, ConstFieldType};
+use BinlogRelay\Replication\Event\DTO\WriteRowsDTO;
+use BinlogRelay\Replication\Event\EventInfo;
+use BinlogRelay\Replication\Event\RowEvent\{ColumnDTO, ColumnDTOCollection, TableMap};
+use BinlogRelay\Replication\Repository\FieldDTO;
 
 $iterations = (int)($argv[1] ?? 20000);
 

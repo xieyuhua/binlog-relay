@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace BinlogRelay\Support;
 
-use Psr\Log\AbstractLogger;
+use BinlogRelay\Replication\Support\LoggerInterface;
 
 /**
- * 极简 PSR-3 日志：写 stderr 或指定文件。
- * 不引入 monolog，保持二进制体积小。
+ * 极简日志：写 stderr 或指定文件。
+ * 实现内置的 LoggerInterface（PSR-3 风格签名），零第三方依赖。
  */
-final class Logger extends AbstractLogger
+final class Logger implements LoggerInterface
 {
     private const LEVELS = ['debug' => 0, 'info' => 1, 'warn' => 2, 'warning' => 2, 'error' => 3];
 
@@ -32,7 +32,27 @@ final class Logger extends AbstractLogger
         }
     }
 
-    public function log($level, \Stringable|string $message, array $context = []): void
+    public function debug(string|\Stringable $message, array $context = []): void
+    {
+        $this->log('debug', $message, $context);
+    }
+
+    public function info(string|\Stringable $message, array $context = []): void
+    {
+        $this->log('info', $message, $context);
+    }
+
+    public function warning(string|\Stringable $message, array $context = []): void
+    {
+        $this->log('warning', $message, $context);
+    }
+
+    public function error(string|\Stringable $message, array $context = []): void
+    {
+        $this->log('error', $message, $context);
+    }
+
+    public function log(string|\Stringable $level, string|\Stringable $message, array $context = []): void
     {
         $rank = self::LEVELS[strtolower((string)$level)] ?? 1;
         if ($rank < $this->threshold) {

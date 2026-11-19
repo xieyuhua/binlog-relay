@@ -14,20 +14,20 @@
 
 declare(strict_types=1);
 
-require __DIR__ . '/../vendor/autoload.php';
+require __DIR__ . '/../src/bootstrap.php';
 
 use BinlogRelay\Event\Change;
 use BinlogRelay\Event\EventBuilder;
-use MySQLReplication\BinLog\BinLogCurrent;
-use MySQLReplication\Definitions\ConstEventType;
-use MySQLReplication\Event\DTO\DeleteRowsDTO;
-use MySQLReplication\Event\DTO\UpdateRowsDTO;
-use MySQLReplication\Event\DTO\WriteRowsDTO;
-use MySQLReplication\Event\EventInfo;
-use MySQLReplication\Event\RowEvent\ColumnDTO;
-use MySQLReplication\Event\RowEvent\ColumnDTOCollection;
-use MySQLReplication\Event\RowEvent\TableMap;
-use MySQLReplication\Repository\FieldDTO;
+use BinlogRelay\Replication\BinLog\BinLogCurrent;
+use BinlogRelay\Replication\Definitions\ConstEventType;
+use BinlogRelay\Replication\Event\DTO\DeleteRowsDTO;
+use BinlogRelay\Replication\Event\DTO\UpdateRowsDTO;
+use BinlogRelay\Replication\Event\DTO\WriteRowsDTO;
+use BinlogRelay\Replication\Event\EventInfo;
+use BinlogRelay\Replication\Event\RowEvent\ColumnDTO;
+use BinlogRelay\Replication\Event\RowEvent\ColumnDTOCollection;
+use BinlogRelay\Replication\Event\RowEvent\TableMap;
+use BinlogRelay\Replication\Repository\FieldDTO;
 
 $failed = 0;
 function check(string $name, bool $ok, string $detail = ''): void
@@ -45,15 +45,15 @@ function makeTableMap(): TableMap
     $columns = new ColumnDTOCollection();
     $columns->add(new ColumnDTO(
         new FieldDTO('id', null, null, '', 'int unsigned', 'PRI'),
-        MySQLReplication\Definitions\ConstFieldType::LONG, 0, 0, 0, 0, 0, 0, 0, 0
+        BinlogRelay\Replication\Definitions\ConstFieldType::LONG, 0, 0, 0, 0, 0, 0, 0, 0
     ));
     $columns->add(new ColumnDTO(
         new FieldDTO('name', null, null, '', 'varchar(64)', ''),
-        MySQLReplication\Definitions\ConstFieldType::VARCHAR, 0, 0, 0, 0, 0, 0, 0, 0
+        BinlogRelay\Replication\Definitions\ConstFieldType::VARCHAR, 0, 0, 0, 0, 0, 0, 0, 0
     ));
     $columns->add(new ColumnDTO(
         new FieldDTO('payload', null, null, '', 'blob', ''),
-        MySQLReplication\Definitions\ConstFieldType::BLOB, 0, 0, 0, 0, 0, 0, 0, 0
+        BinlogRelay\Replication\Definitions\ConstFieldType::BLOB, 0, 0, 0, 0, 0, 0, 0, 0
     ));
     return new TableMap('demo', 'orders', '42', 3, $columns);
 }
