@@ -115,8 +115,11 @@ if ($iniPairs !== []) {
 }
 
 /* ---------- 合成 ---------- */
-// Windows 下可执行文件需要 .exe 后缀，否则双击/命令行识别不到
-if (PHP_OS_FAMILY === 'Windows' && !str_ends_with(strtolower($output), '.exe')) {
+// 后缀取决于运行时（micro.sfx）的目标平台，而不是打包机：
+// 交叉打包（Windows 上打 Linux 包）时不能加 .exe
+$sfxKind = detectSfxKind($micro);
+$isWindowsTarget = $sfxKind === 'PE';
+if ($isWindowsTarget && !str_ends_with(strtolower($output), '.exe')) {
     $output .= '.exe';
 }
 
@@ -135,15 +138,39 @@ if (PHP_OS_FAMILY !== 'Windows') {
 }
 
 printf(
-    "合成完成：%s\n  micro.sfx : %s (%s)\n  payload   : %s (%s)\n  ini       : %d 项\n  总计      : %s\n",
+    "合成完成：%s\n  micro.sfx : %s (%s, %s)\n  payload   : %s (%s)\n  ini       : %d 项\n  总计      : %s\n",
     $output,
     $microPath,
     humanSize(strlen($micro)),
+    $sfxKind,
     $input,
     humanSize(strlen($payload)),
     count($iniPairs),
     humanSize($bytes)
 );
+
+// 交叉打包提醒：产物跟随 micro.sfx 的平台
+if ($sfxKind === 'ELF' && PHP_OS_FAMILY === 'Windows') {
+    echo "  注意      : 这是 Linux x86-64 产物，需拷到 Linux 上运行\n";
+} elseif ($sfxKind === 'Mach-O' && PHP_OS_FAMILY !== 'Darwin') {
+    echo "  注意      : 这是 macOS 产物，需拷到 macOS 上运行\n";
+}
+
+/** 按魔数识别运行时目标平台 */
+function detectSfxKind(string $bytes): string
+{
+    $magic = substr($bytes, 0, 4);
+    if ($magic === "\x7fELF") {
+        return 'ELF';
+    }
+    if ($magic === "\xcf\xfa\xed\xfe" || $magic === "\xce\xfa\xed\xfe") {
+        return 'Mach-O';
+    }
+    if (str_starts_with($magic, 'MZ')) {
+        return 'PE';
+    }
+    return 'unknown';
+}
 
 function humanSize(int $bytes): string
 {

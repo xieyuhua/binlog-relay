@@ -292,26 +292,44 @@ php bin/relay reset-position --force   # 从最新 binlog 末尾重新开始
 
 与 webman 的方式一致：**PHP 代码打成 phar + 静态 PHP 运行时（micro.sfx）合成一个可执行文件**。
 
-### 9.1 准备运行时（只需一个 micro.sfx，**不需要 spc**）
+### 9.1 准备运行时（自动下载，无需 spc）
 
-`micro.sfx` 是静态编译的 PHP 解释器，只需拿到文件即可，打包时不再依赖 spc。
+`build.sh` 会**自动下载 workerman 官方提供的 micro.sfx**，无需任何额外工具：
 
 ```bash
-# 方式 A：直接下载预编译版（推荐，选含所需扩展的 micro.sfx）
-#   https://github.com/crazywhalecc/static-php-cli/releases
-cp /path/to/micro.sfx build/micro.sfx
-
-# 方式 B：自己构建一次（只有这一步需要 spc，之后打包不再需要）
-curl -fsSL -o spc https://dl.static-php.dev/static-php-cli/spc-bin/nightly/spc-linux-x86_64
-chmod +x spc
-./spc build:php "sockets,bcmath,pdo_mysql,phar,pcntl,posix,redis" --build-micro
-cp buildroot/bin/micro.sfx build/micro.sfx
+./build/build.sh
+# ==> 本地无 micro.sfx，尝试下载：https://download.workerman.net/php/php8.4.micro.sfx
+# ==> 下载完成：build/micro.sfx (20M)
 ```
 
-micro.sfx 必须包含：`sockets`（binlog 协议走原生 socket，必需）、`bcmath`、`json`、`phar`、
-`pdo_mysql`（读表结构）、`redis`（队列与点位）、`pcntl`/`posix`（优雅退出，可选）。
+已实测该运行时包含本项目所需的全部扩展：
 
-> Windows 上的 micro.sfx 不能动态加载扩展，所有扩展必须静态编入。
+| 必需 | 说明 |
+|---|---|
+| `sockets` | binlog 复制协议走原生 socket，**缺了无法连接主库** |
+| `bcmath` | 解析库用于 binlog 位置的数值比较 |
+| `json` | 消息序列化 |
+| `pdo` + `pdo_mysql` | 读 information_schema 拿列定义与主键 |
+| `redis` | 队列写入与 Redis 点位 |
+| `phar` | 运行时加载打包进二进制的代码 |
+| `pcntl` / `posix` | 优雅退出（SIGTERM） |
+
+其余（`curl`/`openssl`/`mbstring`/`filter`/`tokenizer`/`ctype`）也都在，POST/HTTP Sink 可直接用。
+
+可选的版本/地址覆盖：
+
+```bash
+PHP_VERSION=8.3 ./build/build.sh          # 换 PHP 版本
+MICRO_URL=https://your/mirror.sfx ./build/build.sh
+MICRO_SFX=/path/to/local.sfx ./build/build.sh   # 用本地文件，不下载
+```
+
+> **平台限制（重要）**：workerman 提供的这些 micro.sfx 是 **Linux x86-64** 静态二进制。
+> 在 Windows/macOS 上打包得到的是 Linux 产物，需要拷到 Linux 运行；
+> 若需要 Windows/macOS 原生可执行文件，得自己用 spc 构建对应平台的 micro.sfx。
+>
+> 合成脚本会按 micro.sfx 的魔数判断目标平台：Linux 产物不加 `.exe` 后缀，
+> 并在输出里提示「这是 Linux x86-64 产物」。
 
 ### 9.2 打包
 
@@ -332,12 +350,15 @@ dist/binlog2redis   单体服务二进制
 dist/*.phar         对应的 phar（无 micro.sfx 时只有这个）
 ```
 
-没有 `micro.sfx` 时脚本仍会生成 phar，可直接用系统 PHP 运行：
+下载失败（离线/网络受限）时脚本仍会生成 phar，可直接用系统 PHP 运行：
 
 ```bash
 php dist/relay.phar status
 php dist/binlog2redis.phar check
 ```
+
+实测产物：`dist/relay` 约 19.5 MB（micro.sfx 19.35 MB + 代码 113 KB），
+在 Linux 容器内 `./relay help` 正常输出。
 
 脚本做的事：
 

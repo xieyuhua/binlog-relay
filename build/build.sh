@@ -4,18 +4,23 @@
 #
 # 依赖：
 #   1. composer（仅用于生成 autoload，项目本身零第三方包）
-#   2. 一个现成的 micro.sfx 运行时（放到 build/micro.sfx，或用 MICRO_SFX 指定）
+#   2. micro.sfx 运行时：本地没有时会自动从 workerman 下载
 #
 # 不需要 spc：合成逻辑由 build/micro-combine.php 用纯 PHP 实现，
 # 格式与 spc 的 micro:combine 完全一致。
 #
 # 用法：
-#   ./build/build.sh                    # 同时生成 dist/relay 和 dist/consumer
+#   ./build/build.sh                    # 三个入口全打
 #   ./build/build.sh relay              # 只打生产端
 #   ./build/build.sh consumer           # 只打消费端
-#   MICRO_SFX=/path/to/micro.sfx ./build/build.sh
+#   ./build/build.sh binlog2redis       # 只打单体服务
+#   MICRO_SFX=/path/to/micro.sfx ./build/build.sh   # 用别的运行时
 #
-# 没有 micro.sfx 时仍会生成 phar，可直接 `php dist/relay.phar start` 运行。
+# 跨平台注意：下载的 micro.sfx 是 Linux x86-64 可执行文件。
+# 在 Linux 上打包可直接运行；在 Windows/macOS 上打包得到的是 Linux 产物
+# （可用于交叉部署），本机无法执行。
+#
+# 没有 micro.sfx 且下载失败时仍会生成 phar，可直接 `php dist/relay.phar start`。
 #
 set -euo pipefail
 
@@ -23,6 +28,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/dist"
 MICRO_SFX="${MICRO_SFX:-$ROOT/build/micro.sfx}"
 TARGET="${1:-all}"
+PHP_VERSION="${PHP_VERSION:-8.4}"
+MICRO_URL="${MICRO_URL:-https://download.workerman.net/php/php${PHP_VERSION}.micro.sfx}"
+
+# 解析目标平台：显式指定优先，否则按当前系统推断
+TARGET_OS="${TARGET_OS:-$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')}"
+TARGET_ARCH="${TARGET_ARCH:-$(uname -m 2>/dev/null)}"
 
 # 注入到二进制里的运行时 ini（可按需增删）
 INI_FLAGS=(
@@ -36,6 +47,48 @@ echo "==> 1/4 清理与准备依赖"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 composer install --no-dev --classmap-authoritative --no-interaction --working-dir="$ROOT" --quiet
+
+# 自动获取 micro.sfx（本地优先，缺失则从 workerman 下载）
+ensure_micro_sfx() {
+  if [[ -s "$MICRO_SFX" ]]; then
+    echo "    使用已有运行时：$MICRO_SFX ($(du -h "$MICRO_SFX" | cut -f1))"
+    return 0
+  fi
+
+  echo "    本地无 micro.sfx，尝试下载：$MICRO_URL"
+  mkdir -p "$(dirname "$MICRO_SFX")"
+
+  local tmp="$MICRO_SFX.part"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 300 -o "$tmp" "$MICRO_URL" || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$tmp" "$MICRO_URL" || true
+  else
+    echo "    没有 curl/wget，跳过下载"
+    return 1
+  fi
+
+  # 校验：至少 1MB，且是 ELF / Mach-O / PE 之一
+  if [[ ! -s "$tmp" ]] || [[ $(wc -c < "$tmp") -lt 1048576 ]]; then
+    echo "    下载失败或文件异常，跳过合成"
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! head -c 4 "$tmp" | od -An -tx1 | grep -qE '7f 45 4c 46|cf fa ed fe|4d 5a'; then
+    echo "    下载内容不是可执行文件，跳过合成"
+    rm -f "$tmp"
+    return 1
+  fi
+
+  mv "$tmp" "$MICRO_SFX"
+  chmod +x "$MICRO_SFX" 2>/dev/null || true
+  echo "    下载完成：$MICRO_SFX ($(du -h "$MICRO_SFX" | cut -f1))"
+  echo "    平台：$(uname -s 2>/dev/null || echo unknown) / $(uname -m 2>/dev/null || echo unknown)"
+  echo "    注意：workerman 提供的这些是 Linux x86-64 运行时"
+}
+
+HAS_MICRO=1
+ensure_micro_sfx || HAS_MICRO=0
 
 # 公共 stage（src/config/vendor），三个入口共用
 STAGE_BASE="$DIST/stage-base"
