@@ -43,31 +43,19 @@ final class EventBuilder
         $ts = (int)$info->timestamp;
         $serverId = (int)$info->serverId;
 
+        $database = $tableMap->database;
+        $table = $tableMap->table;
         $key = self::tableKey($tableMap);
         $changes = [];
 
-        if ($dto instanceof WriteRowsDTO) {
+        // insert 与 delete 结构一致，合并处理
+        if ($dto instanceof WriteRowsDTO || $dto instanceof DeleteRowsDTO) {
+            $op = $dto instanceof WriteRowsDTO ? Change::INSERT : Change::DELETE;
             foreach ($dto->values as $row) {
                 $changes[] = new Change(
-                    Change::INSERT,
-                    $tableMap->database,
-                    $tableMap->table,
-                    self::normalize($row),
-                    null,
-                    $key,
-                    $file,
-                    $pos,
-                    $gtid,
-                    $ts,
-                    $serverId
-                );
-            }
-        } elseif ($dto instanceof DeleteRowsDTO) {
-            foreach ($dto->values as $row) {
-                $changes[] = new Change(
-                    Change::DELETE,
-                    $tableMap->database,
-                    $tableMap->table,
+                    $op,
+                    $database,
+                    $table,
                     self::normalize($row),
                     null,
                     $key,
@@ -84,8 +72,8 @@ final class EventBuilder
                 $before = self::normalize($pair['before'] ?? []);
                 $changes[] = new Change(
                     Change::UPDATE,
-                    $tableMap->database,
-                    $tableMap->table,
+                    $database,
+                    $table,
                     $after,
                     $before,
                     $key,

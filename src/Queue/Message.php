@@ -37,6 +37,9 @@ final readonly class Message
     }
 
     /** 生产端：Change → Stream 字段 */
+    /** json_encode 的固定选项，避免每次调用重新求值常量表达式 */
+    private const JSON_FLAGS = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE;
+
     public static function fromChange(Change $change): array
     {
         return [
@@ -46,10 +49,8 @@ final readonly class Message
             'pk'   => $change->rowIdentity(),
             'pos'  => $change->binlogFile . ':' . $change->binlogPos,
             'ts'   => (string)$change->timestamp,
-            'data' => json_encode(
-                $change->toArray(),
-                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
-            ),
+            // 行数据先按 flag 编码，失败时降级为空对象，避免向 Redis 写入 null
+            'data' => json_encode($change->toArray(), self::JSON_FLAGS) ?: '{}',
         ];
     }
 

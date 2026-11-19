@@ -8,7 +8,6 @@ use BinlogRelay\Checkpoint\Checkpoint;
 use BinlogRelay\Checkpoint\FileStore;
 use BinlogRelay\Checkpoint\PositionManager;
 use BinlogRelay\Checkpoint\RedisStore;
-use BinlogRelay\Event\ColumnProjector;
 use BinlogRelay\Event\Filter;
 use BinlogRelay\Handler\HandlerChain;
 use BinlogRelay\Support\Logger;
@@ -26,7 +25,7 @@ final class Relay
     private Logger $logger;
     private PositionManager $positions;
     private HandlerChain $handlers;
-    private Subscriber $subscriber;
+    private RowSubscriber $subscriber;
     private bool $running = true;
 
     public function __construct(array $config)
@@ -56,21 +55,13 @@ final class Relay
         $this->handlers = new HandlerChain($this->logger);
         $this->handlers->build($this->config['handlers'] ?? []);
 
-        $filter = Filter::fromConfig($this->config['filter'] ?? []);
-        $projector = null;
-        $columnCfg = $this->config['filter']['columns'] ?? [];
-        if (is_array($columnCfg) && $columnCfg !== []) {
-            $projector = ColumnProjector::fromConfig($columnCfg);
-            $this->logger->info('列裁剪已启用，配置表数：' . count($columnCfg));
-        }
-
-        $this->subscriber = new Subscriber(
+        $this->subscriber = new RowSubscriber(
             $this->handlers,
-            $filter,
+            Filter::fromConfig($this->config['filter'] ?? []),
             $this->positions,
             $this->logger,
             (int)($this->config['batch_size'] ?? 200),
-            $projector
+            Connector::makeProjector($this->config, $this->logger)
         );
     }
 
@@ -89,43 +80,7 @@ final class Relay
     public function runUntil(?float $deadline): void
     {
         $mysql = $this->config['mysql'];
-        $builder = (new ConfigBuilder())
-            ->withUser((string)$mysql['user'])
-            ->withHost((string)$mysql['host'])
-            ->withPort((int)$mysql['port'])
-            ->withPassword((string)$mysql['password'])
-            ->withCharset((string)($mysql['charset'] ?? 'utf8mb4'))
-            ->withSlaveId((int)$mysql['slave_id'])
-            ->withHeartbeatPeriod((float)($mysql['heartbeat'] ?? 30))
-            ->withTableCacheSize((int)($mysql['table_cache_size'] ?? 256))
-            // 只订阅行变更与事务边界；DDL（Query）等事件不进入业务管道
-            ->withEventsOnly([
-                ConstEventType::WRITE_ROWS_EVENT_V1->value,
-                ConstEventType::WRITE_ROWS_EVENT_V2->value,
-                ConstEventType::UPDATE_ROWS_EVENT_V1->value,
-                ConstEventType::UPDATE_ROWS_EVENT_V2->value,
-                ConstEventType::DELETE_ROWS_EVENT_V1->value,
-                ConstEventType::DELETE_ROWS_EVENT_V2->value,
-                ConstEventType::XID_EVENT->value,
-                ConstEventType::ROTATE_EVENT->value,
-                ConstEventType::GTID_LOG_EVENT->value,
-            ]);
-
-        $filter = $this->config['filter'] ?? [];
-        $builder = $this->applyFilter($builder, $filter, Filter::fromConfig($filter));
-
-        $checkpoint = $this->positions->load();
-        if ($checkpoint !== null) {
-            $builder = $this->applyCheckpoint($builder, $checkpoint);
-            $this->logger->info(sprintf(
-                '从已保存点位恢复：%s',
-                $checkpoint->binlogFile !== ''
-                    ? $checkpoint->binlogFile . ':' . $checkpoint->binlogPos
-                    : 'GTID ' . $checkpoint->gtid
-            ));
-        } else {
-            $this->logger->info('未找到历史点位，将从当前最新 binlog 末尾开始');
-        }
+        $builder = Connector::build($this->config, $this->positions->load(), $this->logger);
 
         $factory = new MySQLReplicationFactory($builder->build(), logger: $this->logger);
         $factory->registerSubscriber($this->subscriber);
@@ -142,45 +97,6 @@ final class Relay
         $factory->runWithStopCheck(function () use ($deadline): bool {
             return !$this->running || ($deadline !== null && microtime(true) >= $deadline);
         });
-    }
-
-    private function applyFilter(ConfigBuilder $builder, array $filter, Filter $filterObj): ConfigBuilder
-    {
-        $databases = $filter['databases'] ?? [];
-        $tables = $filter['tables'] ?? [];
-
-        // v9 只支持白名单（Only）；忽略规则由 BinlogRelay\Event\Filter 在业务侧兜底
-        if ($databases !== []) {
-            $builder = $builder->withDatabasesOnly($databases);
-        }
-
-        // 下推表过滤到 TABLE_MAP 阶段：
-        // 命中 withTablesOnly 表清单之外的表，库会直接跳过 information_schema 查询与行解码，
-        // 只消耗网络带宽。only_configured 时把 columns 里配置的表也并入清单。
-        if ($filterObj->isOnlyConfigured()) {
-            $tables = $filterObj->configuredTables();
-            // 没有任何已配置表时不能下推空数组（会被理解为"不过滤"），退化为业务侧过滤
-            if ($tables !== []) {
-                $builder = $builder->withTablesOnly($tables);
-            }
-        } elseif ($tables !== []) {
-            $builder = $builder->withTablesOnly($tables);
-        }
-
-        return $builder;
-    }
-
-    private function applyCheckpoint(ConfigBuilder $builder, Checkpoint $checkpoint): ConfigBuilder
-    {
-        if ($checkpoint->isGtidMode()) {
-            return $builder->withGtid($checkpoint->gtid);
-        }
-        if ($checkpoint->binlogFile !== '') {
-            return $builder
-                ->withBinLogFileName($checkpoint->binlogFile)
-                ->withBinLogPosition($checkpoint->binlogPos);
-        }
-        return $builder;
     }
 
     private function makePositionManager(): PositionManager

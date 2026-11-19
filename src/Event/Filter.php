@@ -67,7 +67,20 @@ final class Filter
         );
     }
 
+    /** @var array<string,bool> 判定结果缓存，键为 "db\0table"；表数量有限，无需淘汰 */
+    private array $cache = [];
+
     public function allows(string $database, string $table): bool
+    {
+        // 同一张表的连续事件非常多，缓存判定结果避免重复线性查找
+        $key = $database . "\0" . $table;
+        if (isset($this->cache[$key])) {
+            return $this->cache[$key];
+        }
+        return $this->cache[$key] = $this->decide($database, $table);
+    }
+
+    private function decide(string $database, string $table): bool
     {
         if ($this->databasesIgnore !== [] && in_array($database, $this->databasesIgnore, true)) {
             return false;

@@ -193,38 +193,35 @@ function cmd_retry_dlq(array $config, int $limit): void
 
 function cmd_check(array $config): void
 {
-    $ok = true;
+    $check = new BinlogRelay\Console\CheckCommand();
+    $redis = null;
 
     try {
         $redis = redis($config);
         $redis->ping();
-        echo "[OK] Redis 连接成功\n";
+        $check->ok('Redis 连接成功');
     } catch (Throwable $e) {
-        echo '[FAIL] Redis 连接失败：' . $e->getMessage() . "\n";
-        $ok = false;
-        $redis = null;
+        $check->fail('Redis 连接失败：' . $e->getMessage());
     }
 
     if ($redis !== null) {
         $len = (int)$redis->xLen($config['stream']);
-        echo "[OK] stream {$config['stream']} 长度 {$len}\n";
+        $check->ok("stream {$config['stream']} 长度 {$len}");
         if ($len === 0) {
-            echo "[WARN] stream 为空，确认生产端 relay 已使用 RedisStreamHandler\n";
+            $check->warn('stream 为空，确认生产端已写入该队列');
         }
     }
 
     try {
         $sink = SinkFactory::make($config['sink']);
         $sink->boot();
-        echo '[OK] sink 初始化成功：' . $sink->name() . "\n";
+        $check->ok('sink 初始化成功：' . $sink->name());
         $sink->close();
     } catch (Throwable $e) {
-        echo '[FAIL] sink 初始化失败：' . $e->getMessage() . "\n";
-        $ok = false;
+        $check->fail('sink 初始化失败：' . $e->getMessage());
     }
 
-    echo $ok ? "\n自检通过\n" : "\n自检未通过\n";
-    exit($ok ? 0 : 1);
+    exit($check->result());
 }
 
 /* ===================== 工具 ===================== */

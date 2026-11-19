@@ -27,13 +27,12 @@ define('RELAY_ROOT', str_starts_with(__FILE__, 'phar://') ? __DIR__ : dirname(__
 
 require RELAY_ROOT . '/src/bootstrap.php';
 
-use BinlogRelay\Checkpoint\Checkpoint;
 use BinlogRelay\Checkpoint\FileStore;
 use BinlogRelay\Checkpoint\PositionManager;
 use BinlogRelay\Checkpoint\RedisStore;
 use BinlogRelay\Checkpoint\StoreInterface;
-use BinlogRelay\Event\ColumnProjector;
 use BinlogRelay\Event\Filter;
+use BinlogRelay\Relay\Connector;
 use BinlogRelay\Standalone\RelaySubscriber;
 use BinlogRelay\Standalone\Runner;
 use BinlogRelay\Standalone\StreamWriter;
@@ -93,7 +92,7 @@ function run_service(array $config, string $command, array $options): void
         $positions,
         $logger,
         (int)($config['batch_size'] ?? 200),
-        make_projector($config, $logger)
+        Connector::makeProjector($config, $logger)
     );
 
     $deadline = $command === 'once'
@@ -113,84 +112,18 @@ function run_service(array $config, string $command, array $options): void
 
 function show_status(array $config): void
 {
-    $store = make_store($config);
-    $cp = $store->load();
-    printf("存储后端：%s\n", $store->name());
-    if ($cp === null) {
-        echo "尚无点位（将从最新 binlog 末尾开始）\n";
-        return;
-    }
-    if ($cp->isGtidMode()) {
-        printf("GTID：%s\n", $cp->gtid);
-    }
-    printf("binlog：%s:%s\n", $cp->binlogFile, $cp->binlogPos);
-    printf("累计事件：%d\n", $cp->events);
-    printf("最后更新：%s\n", $cp->updatedAt ? date('Y-m-d H:i:s', $cp->updatedAt) : '-');
+    BinlogRelay\Console\CheckpointCommand::status(make_store($config), '将从最新 binlog 末尾开始');
 }
 
 function reset_position(array $config, array $options): void
 {
-    $store = make_store($config);
-    $cp = $store->load();
-    if ($cp !== null && !isset($options['force'])) {
-        fwrite(STDERR, "点位存在（{$cp->binlogFile}:{$cp->binlogPos}），确认重置请加 --force\n");
-        exit(2);
-    }
-    $owner = 'reset:' . getmypid();
-    if (!$store->acquireLock($owner, 10)) {
-        fwrite(STDERR, "服务正在运行并持有锁，请先停止\n");
-        exit(3);
-    }
-    $store->save(new Checkpoint());
-    $store->releaseLock($owner);
-    echo "点位已重置\n";
+    exit(BinlogRelay\Console\CheckpointCommand::reset(make_store($config), isset($options['force'])));
 }
 
 function run_check(array $config): int
 {
-    $ok = true;
-    $mysql = $config['mysql'];
-
-    try {
-        $pdo = new PDO(
-            sprintf('mysql:host=%s;port=%d;charset=utf8mb4', $mysql['host'], $mysql['port']),
-            $mysql['user'],
-            $mysql['password'],
-            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5]
-        );
-        echo "[OK] MySQL 连接成功\n";
-
-        $vars = [];
-        foreach ($pdo->query("SHOW GLOBAL VARIABLES WHERE Variable_name IN
-            ('binlog_format','binlog_row_image','log_bin')") as $row) {
-            $vars[$row['Variable_name']] = $row['Value'];
-        }
-        foreach (['log_bin' => 'ON', 'binlog_format' => 'ROW', 'binlog_row_image' => 'FULL'] as $k => $want) {
-            $got = strtoupper((string)($vars[$k] ?? ''));
-            echo ($got === $want ? '[OK] ' : '[FAIL] ') . "{$k}={$got}\n";
-            $ok = $ok && $got === $want;
-        }
-        $hasRepl = false;
-        foreach ($pdo->query('SHOW GRANTS')->fetchAll(PDO::FETCH_COLUMN) as $g) {
-            if (stripos($g, 'REPLICATION') !== false) {
-                $hasRepl = true;
-            }
-        }
-        echo ($hasRepl ? '[OK] ' : '[FAIL] ') . "复制权限\n";
-        $ok = $ok && $hasRepl;
-    } catch (Throwable $e) {
-        echo '[FAIL] MySQL：' . $e->getMessage() . "\n";
-        $ok = false;
-    }
-
-    try {
-        $store = make_store($config);
-        $store->load();
-        echo '[OK] 点位存储：' . $store->name() . "\n";
-    } catch (Throwable $e) {
-        echo '[FAIL] 点位存储：' . $e->getMessage() . "\n";
-        $ok = false;
-    }
+    $check = BinlogRelay\Console\CheckCommand::mysql($config)
+        ->checkpoint(make_store($config));
 
     try {
         $cfg = $config['redis'];
@@ -200,16 +133,14 @@ function run_check(array $config): int
             $r->auth((string)$cfg['password']);
         }
         $r->ping();
-        echo "[OK] Redis 连接成功\n";
         $topics = $cfg['topics'] ?? [['stream' => $cfg['stream'] ?? 'binlog:events']];
-        echo '[OK] 写入目标：' . implode(', ', array_column($topics, 'stream')) . "\n";
+        $check->ok('Redis 连接成功')
+            ->ok('写入目标：' . implode(', ', array_column($topics, 'stream')));
     } catch (Throwable $e) {
-        echo '[FAIL] Redis：' . $e->getMessage() . "\n";
-        $ok = false;
+        $check->fail('Redis：' . $e->getMessage());
     }
 
-    echo $ok ? "\n自检通过\n" : "\n自检未通过\n";
-    return $ok ? 0 : 1;
+    return $check->result();
 }
 
 /* ===================== 配置与工具 ===================== */
@@ -256,16 +187,6 @@ function make_positions(StoreInterface $store, Logger $logger, array $config): P
         (int)($cfg['every_events'] ?? 100),
         (float)($cfg['every_seconds'] ?? 1.0)
     );
-}
-
-function make_projector(array $config, Logger $logger): ?ColumnProjector
-{
-    $cols = $config['filter']['columns'] ?? [];
-    if (!is_array($cols) || $cols === []) {
-        return null;
-    }
-    $logger->info('列裁剪已启用，配置表数：' . count($cols));
-    return ColumnProjector::fromConfig($cols);
 }
 
 function install_signals(object $runner): void

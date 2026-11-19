@@ -8,43 +8,51 @@ use BinlogRelay\Checkpoint\PositionManager;
 use BinlogRelay\Event\ColumnProjector;
 use BinlogRelay\Event\EventBuilder;
 use BinlogRelay\Event\Filter;
-use BinlogRelay\Handler\HandlerChain;
-use BinlogRelay\Support\Logger;
+use BinlogRelay\Handler\HandlerInterface;
 use BinlogRelay\Replication\Definitions\ConstEventsNames;
+use BinlogRelay\Replication\Event\DTO\DeleteRowsDTO;
 use BinlogRelay\Replication\Event\DTO\EventDTO;
+use BinlogRelay\Replication\Event\DTO\UpdateRowsDTO;
+use BinlogRelay\Replication\Event\DTO\WriteRowsDTO;
 use BinlogRelay\Replication\Event\DTO\RowsDTO;
 use BinlogRelay\Replication\Event\EventSubscribers;
+use BinlogRelay\Support\Logger;
 
 /**
- * 事件订阅入口：只处理行变更，其余事件仅用于维护点位
+ * binlog 行事件订阅：过滤 → 归一化 → 列裁剪 → 攒批 → 交给 handler
  *
- * 背压策略：
- * - 单个事务/事件内的变更攒到 batch_size 就提交一次 handler
- * - handler 抛异常 → 立即向上抛，进程退出，点位停在上一批
+ * 生产端（Relay）与单体（binlog2redis）共用这一份实现，
+ * 差异只在注入的 handler 是 HandlerChain 还是单个 StreamWriter。
+ *
+ * 语义：
+ * - 行变更先进缓冲，攒够 batchSize 行或超过 1 秒就提交
+ * - 事务结束（XID）必定提交，保证一个事务不会被无限延后
+ * - handler 抛异常直接向上抛，进程退出，点位停在上一批
  */
-final class Subscriber extends EventSubscribers
+class RowSubscriber extends EventSubscribers
 {
-    private array $buffer = [];
-    private int $bufferedBytes = 0;
-    private int $bufferedRows = 0;
-    private float $lastFlushAt = 0.0;
+    /** 缓冲行数上限，防止单事务过大撑爆内存 */
+    private const MAX_BUFFERED_ROWS = 20000;
 
-    private const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;   // 单批内存上限，防止大事务撑爆
-    private const AVG_ROW_BYTES = 96;                     // 粗估每行 JSON 体积，只用于背压
+    /** @var list<\BinlogRelay\Event\Change> */
+    private array $buffer = [];
+    private int $bufferedRows = 0;
+    private float $lastFlushAt;
 
     public function __construct(
-        private readonly HandlerChain $handlers,
-        private readonly Filter $filter,
-        private readonly PositionManager $positions,
-        private readonly Logger $logger,
-        private readonly int $batchSize = 200,
-        private readonly ?ColumnProjector $projector = null,
+        protected readonly HandlerInterface $handler,
+        protected readonly Filter $filter,
+        protected readonly PositionManager $positions,
+        protected readonly Logger $logger,
+        protected readonly int $batchSize = 200,
+        protected readonly ?ColumnProjector $projector = null,
     ) {
         $this->lastFlushAt = microtime(true);
     }
 
     public static function getSubscribedEvents(): array
     {
+        // 注意：事件名来自 ConstEventsNames（'write'），不是 ConstEventType（'WRITE_ROWS_EVENT_V2'）
         return [
             ConstEventsNames::WRITE->value  => 'onWrite',
             ConstEventsNames::UPDATE->value => 'onUpdate',
@@ -55,29 +63,28 @@ final class Subscriber extends EventSubscribers
         ];
     }
 
-    public function onWrite(\BinlogRelay\Replication\Event\DTO\WriteRowsDTO $event): void
+    public function onWrite(WriteRowsDTO $event): void
     {
         $this->ingest($event);
     }
 
-    public function onUpdate(\BinlogRelay\Replication\Event\DTO\UpdateRowsDTO $event): void
+    public function onUpdate(UpdateRowsDTO $event): void
     {
         $this->ingest($event);
     }
 
-    public function onDelete(\BinlogRelay\Replication\Event\DTO\DeleteRowsDTO $event): void
+    public function onDelete(DeleteRowsDTO $event): void
     {
         $this->ingest($event);
     }
 
-    /** 事务提交：把当前缓冲全部交给 handler，然后推进点位 */
+    /** 事务提交：把缓冲全部交给 handler，然后推进点位 */
     public function onXID(EventDTO $event): void
     {
         $this->flush();
         $this->positions->track($event->getEventInfo()->binLogCurrent);
     }
 
-    /** binlog 切换文件：点位只在 Rotate 时更新文件名，不需要立即落盘 */
     public function onRotate(EventDTO $event): void
     {
         $this->positions->track($event->getEventInfo()->binLogCurrent);
@@ -90,26 +97,23 @@ final class Subscriber extends EventSubscribers
 
     private function ingest(RowsDTO $dto): void
     {
-        $database = $dto->tableMap->database;
-        $table = $dto->tableMap->table;
-        if (!$this->filter->allows($database, $table)) {
+        $tableMap = $dto->tableMap;
+        if (!$this->filter->allows($tableMap->database, $tableMap->table)) {
             return;
         }
 
         $changes = EventBuilder::fromRowsDTO($dto);
-        // 列裁剪在入缓冲前完成：省内存、也省后续 JSON 编码与队列体积
         if ($this->projector !== null) {
             $changes = $this->projector->apply($changes);
         }
+
         foreach ($changes as $change) {
             $this->buffer[] = $change;
         }
-        // 用行数粗估内存，避免为背压额外做一次 json_encode（实测 1.2µs/事件）
         $this->bufferedRows += count($changes);
-        $this->bufferedBytes = $this->bufferedRows * self::AVG_ROW_BYTES;
 
         if ($this->bufferedRows >= $this->batchSize
-            || $this->bufferedBytes >= self::MAX_BUFFERED_BYTES
+            || $this->bufferedRows >= self::MAX_BUFFERED_ROWS
             || microtime(true) - $this->lastFlushAt >= 1.0) {
             $this->flush();
             $this->positions->track($dto->getEventInfo()->binLogCurrent);
@@ -123,9 +127,8 @@ final class Subscriber extends EventSubscribers
         }
         $batch = $this->buffer;
         $this->buffer = [];
-        $this->bufferedBytes = 0;
         $this->bufferedRows = 0;
         $this->lastFlushAt = microtime(true);
-        $this->handlers->handle($batch);
+        $this->handler->handle($batch);
     }
 }
