@@ -453,13 +453,31 @@ binlog-relay/
 
 ## 13. 命令一览
 
+**生产端**
+
 ```bash
 php bin/relay check                     # 自检
-php bin/relay start                     # 常驻消费
+php bin/relay start                     # 常驻消费 binlog
 php bin/relay once --seconds=5          # 消费 5 秒后退出（联调）
 php bin/relay status                    # 点位、持有者、累计事件
 php bin/relay reset-position --force    # 重置点位
+```
 
+**消费端**
+
+```bash
+php bin/consumer check                     # Redis + sink 连通性自检
+php bin/consumer create-group              # 创建 consumer group
+php bin/consumer start                     # 常驻消费
+php bin/consumer once --seconds=3          # 消费 3 秒后退出（联调）
+php bin/consumer status                    # 长度 / pending / lag
+php bin/consumer groups                    # 所有 group 与消费者
+php bin/consumer retry-dlq --limit=100     # 死信重投主队列
+```
+
+**其他**
+
+```bash
 php tests/run-all.php                   # 全量测试
 php tests/bench.php                     # 框架开销基准
 ```
@@ -502,3 +520,231 @@ while (true) {
 - `pos` 字段（`binlog_file:pos`）可直接作为幂等键
 - 消费端用裸 SQL + 批量 values，不要逐条走 ORM（慢 3–10 倍）
 - 同一 row 需要严格有序时，按 `pk` hash 分流到多条 stream 并行消费
+
+---
+
+## 15. 消费端架构（`bin/consumer`）
+
+生产端只负责写队列，消费端独立进程、独立部署、独立扩缩容。
+
+```
+relay（1 个）                    consumer（N 个，按需扩）
+┌──────────────┐   XADD     ┌──────────────────────────────┐
+│ binlog 解析   │ ────────► │ Redis Stream                 │
+└──────────────┘  pipeline  │  binlog:events               │
+                            │  binlog:events:dead (DLQ)    │
+                            └──────────────┬───────────────┘
+                                           │ XREADGROUP
+                        ┌──────────────────┼──────────────────┐
+                        ▼                  ▼                  ▼
+                   consumer-1         consumer-2         consumer-3
+                   HTTP 推送          MySQL upsert       ES _bulk
+```
+
+### 15.1 消息格式（生产端与消费端共用契约）
+
+Redis Stream entry 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `op` | `insert` / `update` / `delete` |
+| `db` / `tbl` | 源库 / 源表 |
+| `pk` | `db.table:主键值`，直接当幂等键 |
+| `pos` | `binlog_file:pos`，用于审计与去重 |
+| `ts` | 事件时间戳（秒） |
+| `data` | 完整 Change 的 JSON（含 `row` / `before` / `table_key`） |
+
+契约代码：`src/Queue/Message.php`。`data` 损坏时消费端会用扁平字段降级重建，老消息也能消费。
+
+### 15.2 可靠性语义
+
+- **至少一次**：`XACK` 在 sink 写入成功之后
+- **原地重试**：失败后同批指数退避重试（默认 2s → 4s → 8s…最多 30s），不立即丢回队列
+- **死信**：连续失败 `max_retries` 次后转 `binlog:events:dead` 并 ACK，避免一条坏消息卡死整个 group
+- **接管遗留**：启动/空闲时用 `XAUTOCLAIM` 收回超过 `claim_min_idle_ms` 未确认的消息
+- **幂等前提**：以上任意环节重放，都需要 sink 端按 `pk` 幂等（`ON DUPLICATE KEY` / ES `_id` / CK ReplacingMergeTree）
+
+### 15.3 五种 Sink
+
+配置 `config/consumer.php` 的 `sink.driver`：
+
+```bash
+CONSUMER_SINK=mysql CONSUMER_MYSQL_DB=mirror php bin/consumer start
+```
+
+| driver | 写入方式 | 幂等机制 | 适用 |
+|---|---|---|---|
+| `http` | 整批 POST `{events:[...]}` | 接收方按 `pk`+`pos` 去重 | 对接任意业务接口 |
+| `tcp` | 长连接 + `[4B 长度][JSON]` 帧，服务端回 `0x06` | 接收方幂等 | 内网高吞吐、跨语言 |
+| `mysql` | 按表分组，一条多值 `INSERT ... ON DUPLICATE KEY UPDATE` | 主键覆盖 | 镜像库、数仓 ODS |
+| `clickhouse` | HTTP `INSERT ... FORMAT JSONEachRow`，按表分批 | ReplacingMergeTree（主键去重） | 大表分析、日志 |
+| `elasticsearch` | `_bulk`，按体积切分（默认 5MB/请求） | `_id` = 主键值 | 搜索索引同步 |
+
+**MySQL Sink 注意事项**
+
+- 目标表名前缀默认 `mirror_`：源 `orders` → `mirror_orders`
+- 目标表主键必须与源表一致，否则 `ON DUPLICATE KEY UPDATE` 会插重复
+- `delete` 走 `WHERE 主键 IN (...)`；无主键表会直接抛错，请改用过滤规则跳过
+- 二进制列自动 base64 解码回原始字节
+
+**ClickHouse Sink 注意事项**
+
+- 删除默认走软删：写 `_is_deleted=1`，目标表需有该列（`delete_mode=skip` 可忽略删除）
+- 查询时用 `FINAL` 或按版本列去重
+- 表结构需要自己建；CK 不做在线 schema 变更
+
+**HTTP / TCP 的接收端契约**
+
+```json
+{ "events": [
+  { "id":"1700000000000-0", "op":"update", "db":"shop", "tbl":"orders",
+    "pk":"shop.orders:7", "pos":"mysql-bin.000012:4321", "ts":1795013415,
+    "data": { "row": {...}, "before": {...}, "table_key": ["id"] } }
+] }
+```
+
+接收方返回 2xx 即视为成功。4xx 会立刻失败（不重试），5xx 由消费端按退避重试。
+
+### 15.4 扩缩容
+
+```bash
+# 多个消费者共享同一个 group：消息只会投递给其中一个
+CONSUMER_NAME=worker-1 php bin/consumer start
+CONSUMER_NAME=worker-2 php bin/consumer start
+```
+
+- 同一 `group` 下所有消费者**分摊**消息
+- 不同业务用**不同 stream + 不同 group**，互不影响
+- 容器里 `CONSUMER_NAME` 用 `$HOSTNAME`，避免重启后 pending 归属混乱
+
+### 15.5 排障
+
+| 现象 | 处理 |
+|---|---|
+| `lag` 持续增长 | 消费端处理不过来：加消费者，或把 sink 改成批量写 |
+| `pending` 堆积且 `idle` 很大 | 消费者掉线/卡住；确认进程存活，`claim_min_idle_ms` 内会自动接管 |
+| 一直重试同一批 | 看日志里的 sink 错误；修好后会自动恢复，或等它进死信 |
+| 死信里堆消息 | 修复数据/下游后 `php bin/consumer retry-dlq --limit=500` |
+| 消费端重启后重复处理 | 正常（至少一次）；确认 sink 幂等 |
+
+---
+
+## 16. 一条数据分发到多个业务 topic
+
+需求：**同一个 binlog 事件要同时进入多个业务队列**（订单业务、库存业务、搜索索引、审计…），且各业务互不影响。
+
+### 16.1 推荐架构
+
+```
+                       ┌── topic:order   → 订单 consumer  → MySQL/CK
+relay ──MultiStream────┼── topic:stock   → 库存 consumer  → Redis/MySQL
+      （一次 pipeline） └── topic:search  → 搜索 consumer  → ES
+```
+
+`MultiStreamHandler`（`src/Handler/MultiStreamHandler.php`）在**生产端**做扇出：
+
+- 一个 Redis 连接，整批所有 topic 的 XADD 走**同一个 pipeline**，只多花一次网络往返
+- 每条变更可命中**多条规则**，写入多个 stream
+- 各 topic 独立 consumer group、独立 lag，一个业务卡住不影响其它业务
+
+### 16.2 配置（`config/relay.php`）
+
+```php
+'handlers' => [
+    new BinlogRelay\Handler\MultiStreamHandler([
+        // 订单业务：订单主表与明细
+        ['stream' => 'topic:order', 'tables' => ['orders', 'order_items']],
+
+        // 库存业务：库存变化
+        ['stream' => 'topic:stock', 'tables' => ['stock', 'stock_log']],
+
+        // 搜索索引：全表（* 表示不筛表）
+        ['stream' => 'topic:search', 'tables' => ['*']],
+
+        // 审计：只要删除操作
+        ['stream' => 'topic:audit', 'tables' => ['orders', 'order_items'], 'ops' => ['delete']],
+
+        // 只同步某个库的某些表
+        ['stream' => 'topic:crm', 'databases' => ['crm'], 'tables' => ['customers']],
+    ], null, [
+        'host'     => env('RELAY_REDIS_HOST', '127.0.0.1'),
+        'port'     => (int) env('RELAY_REDIS_PORT', 6379),
+        'password' => env('RELAY_REDIS_PASSWORD', ''),
+        'database' => (int) env('RELAY_REDIS_DB', 0),
+    ]),
+],
+```
+
+规则匹配逻辑（`MultiStreamHandler::matches`）：
+
+| 条件 | 未配置 | 配置后 |
+|---|---|---|
+| `databases` | 不限库 | 库名必须命中 |
+| `tables` | 不限表 | 表名必须命中；`['*']` 等价于不限 |
+| `ops` | 不限操作 | 操作必须命中 |
+
+### 16.3 启动各业务的消费端
+
+每个业务一个进程、一个 group：
+
+```bash
+# 订单业务写到 MySQL 镜像库
+CONSUMER_STREAM=topic:order CONSUMER_GROUP=cg:order \
+CONSUMER_NAME=order-1 CONSUMER_SINK=mysql \
+CONSUMER_MYSQL_DB=mirror php bin/consumer start
+
+# 搜索业务写 ES
+CONSUMER_STREAM=topic:search CONSUMER_GROUP=cg:search \
+CONSUMER_NAME=search-1 CONSUMER_SINK=elasticsearch \
+CONSUMER_ES_URL=http://es:9200 php bin/consumer start
+
+# 审计只落 CK
+CONSUMER_STREAM=topic:audit CONSUMER_GROUP=cg:audit \
+CONSUMER_NAME=audit-1 CONSUMER_SINK=clickhouse \
+CONSUMER_CK_DB=audit php bin/consumer start
+```
+
+看各业务积压：
+
+```bash
+CONSUMER_STREAM=topic:order  php bin/consumer status
+CONSUMER_STREAM=topic:stock  php bin/consumer status
+CONSUMER_STREAM=topic:search php bin/consumer status
+```
+
+### 16.4 对业务影响最小化的 5 个要点
+
+1. **按业务拆 topic，不要共用一条 stream**
+   共用时一个消费慢的业务会拖高整条队列的 lag，且无法独立扩缩容。
+
+2. **只订阅需要的表和操作**
+   `MultiStreamHandler` 的 `tables` / `ops` / `databases` 在生产端就过滤掉，消费端不必自己判断，省 IO 也省带宽。
+
+3. **扇出失败要整体失败**
+   `MultiStreamHandler` 只要有一条 XADD 失败就抛异常 → relay 停止推进点位 → 重启后整批重放。
+   这样不会出现"订单 topic 有数据、库存 topic 没有"的长期不一致（短暂窗口由下游幂等覆盖）。
+
+4. **每个业务独立 group，独立消费者名**
+   不要两个业务共用一个 group（会互相抢消息）；容器里 `CONSUMER_NAME=$HOSTNAME`。
+
+5. **MySQL/CK 走批量，ES 走 _bulk**
+   逐条写入是吞吐杀手；`MysqlSink` 已按表合并成一条多值 SQL，`ElasticsearchSink` 按 5MB 切 _bulk。
+
+### 16.5 优先级与隔离（进阶）
+
+如果需要"订单业务必须实时、搜索可以延迟"，不要靠调整消费速度，而是：
+
+- **给关键业务单独部署 relay**（`RELAY_DATABASES` / `RELAY_TABLES` 隔离），物理隔离最彻底
+- 或者**至少拆 topic**：先按 16.2 配好，再给关键 topic 多开消费者实例
+- 极端场景下可以用 `XADD MAXLEN` 给非关键 topic 设更小的裁剪长度，避免磁盘被非关键业务撑爆
+
+### 16.6 吞吐与成本权衡
+
+| 方案 | 网络往返 | 可靠性 | 复杂度 |
+|---|---|---|---|
+| 单 stream + 多 sink（进程内） | 1 | 一损俱损 | 低 |
+| **多 topic 扇出（推荐）** | 1（pipeline） | 独立 | 中 |
+| 每个业务单独跑 relay | N | 完全隔离 | 高 |
+
+`MultiStreamHandler` 的实测开销：一条变更命中 4 个 topic 时，多出 3 次 XADD 的 CPU 开销，
+但因为走同一个 pipeline，网络往返仍是 1 次，整体吞吐相比单 topic 下降约 10–15%。

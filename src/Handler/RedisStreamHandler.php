@@ -5,8 +5,7 @@ declare(strict_types=1);
 namespace BinlogRelay\Handler;
 
 use BinlogRelay\Event\Change;
-
-// env() 定义在 src/Support/env.php，CLI 入口已加载；单独实例化时兜底引入
+use BinlogRelay\Queue\Message;
 
 /**
  * 方式 A：把变更批量推进 Redis Stream（pipeline，一次 RTT）
@@ -60,18 +59,7 @@ final class RedisStreamHandler implements HandlerInterface
             $this->redis->xAdd(
                 $this->stream,
                 '*',
-                [
-                    'op'   => $c->op,
-                    'db'   => $c->database,
-                    'tbl'  => $c->table,
-                    'pk'   => $c->rowIdentity(),
-                    'pos'  => $c->binlogFile . ':' . $c->binlogPos,
-                    'ts'   => (string)$c->timestamp,
-                    'data' => json_encode(
-                        $c->toArray(),
-                        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
-                    ),
-                ],
+                Message::fromChange($c),
                 self::MAX_LEN_APPROX,
                 true
             );

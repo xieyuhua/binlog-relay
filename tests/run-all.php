@@ -11,6 +11,7 @@ $tests = [
     '点位 / 锁 / 过滤器' => __DIR__ . '/selftest.php',
     'EventBuilder 行展开' => __DIR__ . '/EventBuilderTest.php',
     'Handler 链路' => __DIR__ . '/HandlerTest.php',
+    '队列消息与消费端' => __DIR__ . '/ConsumerTest.php',
 ];
 
 $failed = 0;

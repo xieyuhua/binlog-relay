@@ -1,0 +1,328 @@
+#!/usr/bin/env php
+<?php
+/**
+ * binlog-relay 消费端入口
+ *
+ *   consumer start                  启动消费
+ *   consumer once --seconds=3       消费一段时间后退出（联调）
+ *   consumer status                 查看 stream 长度 / pending / lag
+ *   consumer groups                 查看所有 consumer group 与消费者
+ *   consumer retry-dlq --limit=100  把死信重新投回主队列
+ *   consumer create-group           只创建 consumer group
+ *   consumer check                  连通性自检（Redis + sink）
+ *   consumer help
+ */
+
+declare(strict_types=1);
+
+define('RELAY_ROOT', str_starts_with(__FILE__, 'phar://') ? __DIR__ : dirname(__DIR__));
+
+$autoload = RELAY_ROOT . '/vendor/autoload.php';
+if (!is_file($autoload)) {
+    fwrite(STDERR, "找不到 vendor/autoload.php，请先 composer install\n");
+    exit(1);
+}
+require $autoload;
+
+use BinlogRelay\Consumer\Consumer;
+use BinlogRelay\Consumer\SinkFactory;
+use BinlogRelay\Support\Logger;
+
+$configFile = getenv('CONSUMER_CONFIG') ?: '';
+if ($configFile === '' && is_file(getcwd() . '/config/consumer.php')) {
+    $configFile = getcwd() . '/config/consumer.php';
+}
+if ($configFile === '' && is_file(RELAY_ROOT . '/config/consumer.php')) {
+    $configFile = RELAY_ROOT . '/config/consumer.php';
+}
+if ($configFile === '' || !is_file($configFile)) {
+    fwrite(STDERR, "找不到配置文件 config/consumer.php，可用 CONSUMER_CONFIG 指定路径\n");
+    exit(1);
+}
+
+$config = require $configFile;
+date_default_timezone_set($config['timezone'] ?? 'Asia/Shanghai');
+
+$argv = $_SERVER['argv'] ?? [];
+array_shift($argv);
+$command = $argv[0] ?? 'start';
+$options = parse_options(array_slice($argv, 1));
+
+try {
+    switch ($command) {
+        case 'start':
+            cmd_start($config);
+            break;
+        case 'once':
+            cmd_once($config, (float)($options['seconds'] ?? 3));
+            break;
+        case 'status':
+            cmd_status($config);
+            break;
+        case 'groups':
+            cmd_groups($config);
+            break;
+        case 'create-group':
+            cmd_create_group($config);
+            break;
+        case 'retry-dlq':
+            cmd_retry_dlq($config, (int)($options['limit'] ?? 100));
+            break;
+        case 'check':
+            cmd_check($config);
+            break;
+        case 'help':
+        case '--help':
+        case '-h':
+            usage();
+            break;
+        default:
+            fwrite(STDERR, "未知命令：{$command}\n\n");
+            usage();
+            exit(1);
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, '错误：' . $e->getMessage() . PHP_EOL);
+    exit(1);
+}
+
+/* ===================== 命令 ===================== */
+
+function cmd_start(array $config): void
+{
+    $consumer = build($config);
+    install_signals($consumer);
+    $consumer->run();
+}
+
+function cmd_once(array $config, float $seconds): void
+{
+    $consumer = build($config);
+    install_signals($consumer);
+
+    // 用一个 watcher 在到点后置停止标记
+    if (function_exists('pcntl_alarm')) {
+        pcntl_async_signals(true);
+        pcntl_signal(SIGALRM, function () use ($consumer) {
+            $consumer->stop();
+        });
+        // SIGALRM 粒度是秒
+        pcntl_alarm((int)max(1, ceil($seconds)));
+        $consumer->run();
+        return;
+    }
+
+    // 无 pcntl：用基于时间的退出条件（阻塞读取会压到 200ms）
+    $consumer->runUntil(microtime(true) + $seconds);
+}
+
+function cmd_status(array $config): void
+{
+    $redis = redis($config);
+    $client = new BinlogRelay\Consumer\RedisStreamClient($redis);
+    $stream = $config['stream'];
+    $group = $config['group'];
+
+    $info = $client->lag($stream, $group);
+    echo "stream : {$stream}\n";
+    echo "group  : {$group}\n";
+    echo "长度   : {$info['stream_len']}\n";
+    echo "pending: {$info['pending']}（已投递未 ACK）\n";
+    echo "lag    : {$info['lag']}\n";
+
+    $pending = $redis->xPending($stream, $group);
+    if (is_array($pending) && isset($pending['consumers']) && is_array($pending['consumers'])) {
+        echo "消费者 :\n";
+        foreach ($pending['consumers'] as $c) {
+            printf("  - %-32s pending=%d idle=%s\n",
+                $c['name'] ?? '?',
+                (int)($c['pending'] ?? 0),
+                isset($c['idle']) ? round($c['idle'] / 1000) . 's' : '-'
+            );
+        }
+    }
+}
+
+function cmd_groups(array $config): void
+{
+    $redis = redis($config);
+    $groups = $redis->xInfo('GROUPS', $config['stream']);
+    if (!is_array($groups) || $groups === []) {
+        echo "stream {$config['stream']} 没有 consumer group\n";
+        return;
+    }
+    foreach ($groups as $g) {
+        printf(
+            "group=%-24s consumers=%d pending=%d last-delivered=%s\n",
+            $g['name'] ?? '?',
+            (int)($g['consumers'] ?? 0),
+            (int)($g['pending'] ?? 0),
+            $g['last-delivered-id'] ?? '-'
+        );
+    }
+}
+
+function cmd_create_group(array $config): void
+{
+    build($config)->ensureGroup();
+    echo "group 已就绪：{$config['stream']} / {$config['group']}\n";
+}
+
+function cmd_retry_dlq(array $config, int $limit): void
+{
+    $redis = redis($config);
+    $dlq = $config['dead_letter'] ?? '';
+    if ($dlq === '') {
+        fwrite(STDERR, "未配置 dead_letter，无法重投\n");
+        exit(2);
+    }
+
+    // 直接按范围读取，不额外维护死信 consumer group
+    $entries = $redis->xRange($dlq, '-', '+', $limit);
+    if (!is_array($entries) || $entries === []) {
+        echo "死信队列为空\n";
+        return;
+    }
+
+    $redis->multi(Redis::PIPELINE);
+    foreach ($entries as $id => $fields) {
+        unset($fields['error'], $fields['source'], $fields['failed_at']);
+        $redis->xAdd($config['stream'], '*', $fields);
+    }
+    $redis->exec();
+
+    $redis->xDel($dlq, array_keys($entries));
+    echo '已重投 ' . count($entries) . " 条并清空死信\n";
+}
+
+function cmd_check(array $config): void
+{
+    $ok = true;
+
+    try {
+        $redis = redis($config);
+        $redis->ping();
+        echo "[OK] Redis 连接成功\n";
+    } catch (Throwable $e) {
+        echo '[FAIL] Redis 连接失败：' . $e->getMessage() . "\n";
+        $ok = false;
+        $redis = null;
+    }
+
+    if ($redis !== null) {
+        $len = (int)$redis->xLen($config['stream']);
+        echo "[OK] stream {$config['stream']} 长度 {$len}\n";
+        if ($len === 0) {
+            echo "[WARN] stream 为空，确认生产端 relay 已使用 RedisStreamHandler\n";
+        }
+    }
+
+    try {
+        $sink = SinkFactory::make($config['sink']);
+        $sink->boot();
+        echo '[OK] sink 初始化成功：' . $sink->name() . "\n";
+        $sink->close();
+    } catch (Throwable $e) {
+        echo '[FAIL] sink 初始化失败：' . $e->getMessage() . "\n";
+        $ok = false;
+    }
+
+    echo $ok ? "\n自检通过\n" : "\n自检未通过\n";
+    exit($ok ? 0 : 1);
+}
+
+/* ===================== 工具 ===================== */
+
+function build(array $config): Consumer
+{
+    $logger = new Logger(
+        (string)($config['log']['level'] ?? 'info'),
+        (string)($config['log']['file'] ?? '')
+    );
+
+    return new Consumer(
+        new BinlogRelay\Consumer\RedisStreamClient(redis($config)),
+        SinkFactory::make($config['sink']),
+        $logger,
+        (string)$config['stream'],
+        (string)$config['group'],
+        (string)$config['consumer'],
+        (int)$config['batch_size'],
+        (int)$config['block_ms'],
+        (int)$config['max_retries'],
+        (string)($config['dead_letter'] ?? ''),
+        (int)($config['claim_min_idle_ms'] ?? 60000),
+        (float)($config['retry_backoff'] ?? 2.0)
+    );
+}
+
+function redis(array $config): Redis
+{
+    $cfg = $config['redis'];
+    $redis = new Redis();
+    $redis->connect((string)$cfg['host'], (int)$cfg['port'], (float)($cfg['timeout'] ?? 2.0));
+    if ((string)($cfg['password'] ?? '') !== '') {
+        $redis->auth((string)$cfg['password']);
+    }
+    if ((int)($cfg['database'] ?? 0) > 0) {
+        $redis->select((int)$cfg['database']);
+    }
+    return $redis;
+}
+
+function install_signals(Consumer $consumer): void
+{
+    if (!function_exists('pcntl_signal')) {
+        return;
+    }
+    $handler = function () use ($consumer) {
+        $consumer->stop();
+    };
+    pcntl_signal(SIGTERM, $handler);
+    pcntl_signal(SIGINT, $handler);
+    pcntl_async_signals(true);
+}
+
+function parse_options(array $args): array
+{
+    $out = [];
+    foreach ($args as $a) {
+        if (str_starts_with($a, '--')) {
+            $a = substr($a, 2);
+            if (str_contains($a, '=')) {
+                [$k, $v] = explode('=', $a, 2);
+                $out[$k] = $v;
+            } else {
+                $out[$a] = true;
+            }
+        }
+    }
+    return $out;
+}
+
+function usage(): void
+{
+    echo <<<TXT
+binlog-relay consumer · Redis Stream 消费端
+
+用法：
+  consumer start                    启动消费（SIGTERM 优雅退出）
+  consumer once --seconds=3         消费指定秒数后退出（联调）
+  consumer status                   查看 stream 长度 / pending / lag
+  consumer groups                   查看 consumer group 与消费者
+  consumer create-group             创建 consumer group
+  consumer retry-dlq --limit=100    把死信重新投回主队列
+  consumer check                    Redis + sink 连通性自检
+
+环境变量：
+  CONSUMER_CONFIG         配置文件路径（默认 ./config/consumer.php）
+  CONSUMER_STREAM         队列名，默认 binlog:events
+  CONSUMER_GROUP          consumer group，默认 cg:default
+  CONSUMER_NAME           消费者名，默认 主机名-进程号
+  CONSUMER_SINK           http | tcp | mysql | clickhouse | elasticsearch
+  CONSUMER_BATCH          批量大小，默认 500
+  CONSUMER_MAX_RETRIES    失败重试次数，默认 5
+  CONSUMER_DLQ            死信 stream，默认 binlog:events:dead
+
+TXT;
+}

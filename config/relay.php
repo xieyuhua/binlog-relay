@@ -68,6 +68,20 @@ return [
         // 顺序执行。内置：stdout（JSON Lines 打到标准输出）
         // 自定义处理器写全类名，需实现 BinlogRelay\Handler\HandlerInterface
         BinlogRelay\Handler\StdoutHandler::class,
+
+        // 同一个事件分发到多个业务 topic（多队列）：
+        // 一条变更可命中多条规则，写入多条 stream，各自独立消费
+        // new BinlogRelay\Handler\MultiStreamHandler([
+        //     ['stream' => 'topic:order',  'tables' => ['orders', 'order_items']],
+        //     ['stream' => 'topic:stock',  'tables' => ['stock', 'stock_log']],
+        //     ['stream' => 'topic:search', 'tables' => ['*']],                        // 全表
+        //     ['stream' => 'topic:audit',  'tables' => ['orders'], 'ops' => ['delete']],
+        // ], null, [
+        //     'host'     => env('RELAY_REDIS_HOST', '127.0.0.1'),
+        //     'port'     => (int) env('RELAY_REDIS_PORT', 6379),
+        //     'password' => env('RELAY_REDIS_PASSWORD', ''),
+        //     'database' => (int) env('RELAY_REDIS_DB', 0),
+        // ]),
     ],
 
     // 每批多少条事件交给 handler（单条事件可能含多行变更）
