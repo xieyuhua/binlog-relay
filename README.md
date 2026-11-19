@@ -309,30 +309,59 @@ cp buildroot/bin/micro.sfx build/micro.sfx
 
 ### 9.2 打包
 
+**生产端与消费端可以分别打包**，各自一个单文件，互不依赖：
+
 ```bash
-MICRO_SFX=build/micro.sfx ./build/build.sh
-# 产物：dist/relay
+MICRO_SFX=build/micro.sfx ./build/build.sh            # 两个都打
+MICRO_SFX=build/micro.sfx ./build/build.sh relay      # 只打生产端
+MICRO_SFX=build/micro.sfx ./build/build.sh consumer   # 只打消费端
+```
+
+产物：
+
+```
+dist/relay      生产端二进制（含 relay.phar）
+dist/consumer   消费端二进制（含 consumer.phar）
+```
+
+没有 `micro.sfx` 时脚本仍会生成 phar，可直接用系统 PHP 运行（适合先验证逻辑）：
+
+```bash
+php dist/relay.phar status
+php dist/consumer.phar check
 ```
 
 脚本做的事：
 
 1. `composer install --no-dev --classmap-authoritative`
-2. 收集 `src/ config/ vendor/ plus bin/relay` 到 stage
-3. `build/make-phar.php` 打成 `relay.phar`（GZ 压缩）
-4. `spc micro:combine relay.phar --with-micro=micro.sfx --output=dist/relay`
+2. 收集 `src/ config/ vendor/` 到公共 stage（两个入口共用，只做一次）
+3. `build/make-phar.php <stage> <phar> <entry>` 分别打出 `relay.phar` / `consumer.phar`
+4. `spc micro:combine` 合成可执行文件（有 micro.sfx 时）
 5. 注入 ini：`memory_limit=512M`、`error_reporting=E_ALL & ~E_DEPRECATED` 等
+
+两个入口的 phar stub 指向不同 `entryFile`（`relay.php` / `consumer.php`），
+所以 `./consumer status` 和 `./relay status` 是两套独立命令，不会混淆。
 
 ### 9.3 部署
 
 ```bash
+# 生产端（读 binlog）
 scp dist/relay server:/opt/binlog-relay/
 scp -r config .env server:/opt/binlog-relay/    # 配置在外，二进制内
-ssh server
-
-cd /opt/binlog-relay
+ssh server && cd /opt/binlog-relay
 RELAY_CONFIG=./config/relay.php ./relay check
 RELAY_CONFIG=./config/relay.php ./relay start
+
+# 消费端（可以部署到另一台机器，只需要能连 Redis 与下游）
+scp dist/consumer consumer-host:/opt/binlog-consumer/
+scp config/consumer.php consumer-host:/opt/binlog-consumer/config/
+ssh consumer-host && cd /opt/binlog-consumer
+CONSUMER_CONFIG=./config/consumer.php ./consumer check
+CONSUMER_CONFIG=./config/consumer.php CONSUMER_SINK=mysql ./consumer start
 ```
+
+> 消费端不依赖 MySQL 主库，只依赖 Redis 队列与它要写入的下游（MySQL/CK/ES/HTTP/TCP）。
+> 所以一台机器可以只装消费端，另一台（更靠近主库的）只装生产端。
 
 systemd：
 
@@ -889,3 +918,62 @@ RELAY_CHECKPOINT_KEY=relay:catalog php bin/relay start
 - `RELAY_SLAVE_ID` **必须不同**，否则 MySQL 会认为两个从库是同一个，可能互相踢掉
 - `RELAY_CHECKPOINT_KEY` 必须不同，各自维护自己的点位
 - 表集合不要重叠，否则同一变更会被写入两次（下游需幂等）
+
+---
+
+## 19. 只处理已配置的表（`only_configured`）
+
+默认情况下，`tables` / `columns` 没提到过的表会**原样透传**给 handler。
+如果业务只关心少数几张表，其余表既不消费也占队列空间，可以开启白名单模式：
+
+```php
+'filter' => [
+    'tables' => ['orders', 'order_items'],
+    'columns' => [
+        'users' => ['id', 'name', 'phone'],   // 只在 columns 里出现也算"已配置"
+    ],
+    'only_configured' => true,
+],
+```
+
+或环境变量：
+
+```bash
+RELAY_ONLY_CONFIGURED=1 php bin/relay start
+```
+
+### 19.1 判定规则
+
+| 表 | 结果 |
+|---|---|
+| 在 `tables` 里 | ✅ 处理 |
+| 在 `columns` 里 | ✅ 处理（即使不在 `tables`） |
+| 两张表都不在 | ❌ 整表丢弃 |
+| 在 `ignore_tables` 里 | ❌ 丢弃（忽略规则优先级最高） |
+
+已配置表清单 = `tables` ∪ `columns` 的表名，**并集**而不是交集——
+这样"我只想给 users 配裁剪规则"不会因为没写进 `tables` 而被误杀。
+
+`'*'` 通配不参与这个清单（它表示"其它表用这套规则"），所以不能靠 `'*'` 让所有表都算已配置。
+
+### 19.2 性能上的实际收益
+
+开启后，未配置表的过滤会**下推到 TABLE_MAP 阶段**：
+
+| 环节 | 未开启 | 开启 |
+|---|---|---|
+| 读取 binlog 字节 | ✅ | ✅（省不掉，必须顺序读） |
+| 解析 TABLE_MAP | ✅ | ✅ |
+| 查 `information_schema` 拿列定义 | ✅ | ❌ 跳过 |
+| 解码行数据（大字段最贵） | ✅ | ❌ 跳过 |
+| 构造 Change 对象 | ✅ | ❌ 跳过 |
+| 入队 / 网络传输 | ✅ | ❌ 跳过 |
+
+所以：**省 CPU、省内存、省队列带宽，但不省主库到 relay 的 binlog 传输带宽**。
+如果 binlog 里大字段多、写入量大，开启后 CPU 下降通常很明显。
+
+### 19.3 注意
+
+- 开启后如果 `tables` 和 `columns` 都为空，等于**丢弃所有表**（配置里已注明，`relay check` 不会自动拦截，请自行确认）
+- 新上线的表如果业务需要，记得同时加进 `tables` 或 `columns`，否则会被静默丢弃
+- 与 `ignore_tables` 同时配置时，忽略规则优先

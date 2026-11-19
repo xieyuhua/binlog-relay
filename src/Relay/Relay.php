@@ -112,7 +112,7 @@ final class Relay
             ]);
 
         $filter = $this->config['filter'] ?? [];
-        $builder = $this->applyFilter($builder, $filter);
+        $builder = $this->applyFilter($builder, $filter, Filter::fromConfig($filter));
 
         $checkpoint = $this->positions->load();
         if ($checkpoint !== null) {
@@ -144,7 +144,7 @@ final class Relay
         });
     }
 
-    private function applyFilter(ConfigBuilder $builder, array $filter): ConfigBuilder
+    private function applyFilter(ConfigBuilder $builder, array $filter, Filter $filterObj): ConfigBuilder
     {
         $databases = $filter['databases'] ?? [];
         $tables = $filter['tables'] ?? [];
@@ -153,9 +153,20 @@ final class Relay
         if ($databases !== []) {
             $builder = $builder->withDatabasesOnly($databases);
         }
-        if ($tables !== []) {
+
+        // 下推表过滤到 TABLE_MAP 阶段：
+        // 命中 withTablesOnly 表清单之外的表，库会直接跳过 information_schema 查询与行解码，
+        // 只消耗网络带宽。only_configured 时把 columns 里配置的表也并入清单。
+        if ($filterObj->isOnlyConfigured()) {
+            $tables = $filterObj->configuredTables();
+            // 没有任何已配置表时不能下推空数组（会被理解为"不过滤"），退化为业务侧过滤
+            if ($tables !== []) {
+                $builder = $builder->withTablesOnly($tables);
+            }
+        } elseif ($tables !== []) {
             $builder = $builder->withTablesOnly($tables);
         }
+
         return $builder;
     }
 

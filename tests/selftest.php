@@ -75,6 +75,30 @@ check('忽略表拦截', !$f->allows('shop', 'logs'));
 check('忽略库拦截', !$f->allows('mysql', 'user'));
 check('白名单外的库拦截', !$f->allows('other', 't'));
 
+// --- only_configured：未配置的表整表丢弃 ---
+$fCfg = Filter::fromConfig([
+    'tables' => ['orders'],
+    'columns' => ['users' => ['id', 'name']],
+    'only_configured' => true,
+]);
+check('only_configured 放行 tables 里的表', $fCfg->allows('shop', 'orders'));
+check('only_configured 放行 columns 里的表', $fCfg->allows('shop', 'users'));
+check('only_configured 丢弃未配置的表', !$fCfg->allows('shop', 'audit_log'));
+check('resolvedTablesOnly 含并集', $fCfg->configuredTables() === ['orders', 'users'], json_encode($fCfg->configuredTables()));
+
+// 忽略规则优先于 only_configured
+$fIgnore = Filter::fromConfig([
+    'tables' => ['orders', 'logs'],
+    'ignore_tables' => ['logs'],
+    'only_configured' => true,
+]);
+check('忽略规则优先', !$fIgnore->allows('shop', 'logs') && $fIgnore->allows('shop', 'orders'));
+
+// 关闭时保持原语义：tables 白名单仍然生效
+$fOpen = Filter::fromConfig(['tables' => ['orders']]);
+check('关闭 only_configured 时 tables 白名单仍生效',
+    $fOpen->allows('shop', 'orders') && !$fOpen->allows('shop', 'anything'));
+
 // --- handler 异常必须冒泡 ---
 $chain = new HandlerChain($logger);
 $chain->build([new class implements HandlerInterface {

@@ -33,6 +33,12 @@ return [
         'ignore_databases' => csv(env('RELAY_IGNORE_DATABASES', 'mysql,sys,information_schema,performance_schema')),
         'ignore_tables'    => csv(env('RELAY_IGNORE_TABLES', '')),
 
+        // 只处理「已配置」的表：tables 或 columns 里出现过的表名之外，整表丢弃。
+        // 开启后未配置的表会在 TABLE_MAP 阶段跳过解析（省 CPU 和 information_schema 查询），
+        // 但仍会读取 binlog 字节（带宽不省）。
+        // 注意：开启后如果 tables 和 columns 都没配表，等于丢弃所有表。
+        'only_configured' => (bool) env('RELAY_ONLY_CONFIGURED', false),
+
         // 列裁剪：只保留业务需要的列，其余在入队前丢弃
         // 收益：队列体积、网络传输、消费端解析、下游写入全面下降
         // 注意：主键列永远保留；before 行同样会被裁剪
