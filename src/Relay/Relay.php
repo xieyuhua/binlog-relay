@@ -8,6 +8,7 @@ use BinlogRelay\Checkpoint\Checkpoint;
 use BinlogRelay\Checkpoint\FileStore;
 use BinlogRelay\Checkpoint\PositionManager;
 use BinlogRelay\Checkpoint\RedisStore;
+use BinlogRelay\Event\EventBuilder;
 use BinlogRelay\Event\Filter;
 use BinlogRelay\Handler\HandlerChain;
 use BinlogRelay\Support\Logger;
@@ -54,6 +55,9 @@ final class Relay
 
         $this->handlers = new HandlerChain($this->logger);
         $this->handlers->build($this->config['handlers'] ?? []);
+
+        // 无主键表只告警一次，避免每个事件都刷日志
+        EventBuilder::onMissingKey(fn(string $msg) => $this->logger->warning($msg));
 
         $this->subscriber = new RowSubscriber(
             $this->handlers,

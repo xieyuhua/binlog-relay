@@ -133,15 +133,35 @@ final class MysqlSink extends AbstractSink
         $this->pdo->prepare($sql)->execute($values);
     }
 
-    /** @param list<array> $rows */
+    /**
+     * 删除目标行
+     *
+     * 键的优先级与 EventBuilder 一致：主键 → 唯一键 → 整行匹配。
+     * 无键表用整行匹配（WHERE col1=? AND col2=? ...），虽然慢，
+     * 但比"报错让整批进死信"或"删错行"安全。
+     *
+     * @param list<array> $rows
+     */
     private function delete(string $table, array $rows): void
     {
-        $keys = $this->primaryKeys($table);
+        $keys = $this->identityKeys($table);
+
+        // 无键：按整行内容匹配
         if ($keys === []) {
-            throw new RuntimeException("表 {$table} 缺少主键信息，无法安全删除");
+            $cols = array_keys($rows[0]);
+            if ($cols === []) {
+                throw new RuntimeException("表 {$table} 删除事件缺少行数据，无法定位行");
+            }
+            $where = implode(' AND ', array_map(fn($c) => $this->quote($c) . '<=>?', $cols));
+            $stmt = $this->pdo->prepare(sprintf('DELETE FROM %s WHERE %s LIMIT 1', $this->qualifiedTable($table), $where));
+            foreach ($rows as $r) {
+                // <=> 做 NULL 安全比较；LIMIT 1 避免误删同内容的多行
+                $stmt->execute(array_map(fn($c) => $this->normalizeValue($r[$c] ?? null), $cols));
+            }
+            return;
         }
 
-        // 单主键：DELETE ... WHERE id IN (...)
+        // 单键：DELETE ... WHERE id IN (...)
         if (count($keys) === 1) {
             $k = $keys[0];
             $vals = array_map(fn($r) => $this->normalizeValue($r[$k] ?? null), $rows);
@@ -156,7 +176,7 @@ final class MysqlSink extends AbstractSink
             return;
         }
 
-        // 复合主键：逐条执行，仍在一个事务里
+        // 复合键：逐条执行，仍在一个事务里
         $where = implode(' AND ', array_map(fn($k) => $this->quote($k) . '=?', $keys));
         $stmt = $this->pdo->prepare(sprintf('DELETE FROM %s WHERE %s', $this->qualifiedTable($table), $where));
         foreach ($rows as $r) {
@@ -164,29 +184,45 @@ final class MysqlSink extends AbstractSink
         }
     }
 
-    /** @var array<string,list<string>> 主键缓存 */
+    /** @var array<string,list<string>> 定位键缓存 */
     private array $pkCache = [];
 
-    /** @return list<string> */
-    private function primaryKeys(string $table): array
+    /**
+     * 取目标表的定位键：主键优先，其次唯一键，都没有返回空数组
+     *
+     * @return list<string>
+     */
+    private function identityKeys(string $table): array
     {
         $target = $this->targetTable($table);
         if (isset($this->pkCache[$target])) {
             return $this->pkCache[$target];
         }
+
         $stmt = $this->pdo->prepare(
-            'SELECT COLUMN_NAME FROM information_schema.COLUMNS
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_KEY = ?
+            'SELECT COLUMN_NAME, COLUMN_KEY FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_KEY IN (?, ?)
              ORDER BY ORDINAL_POSITION'
         );
-        $stmt->execute([$target, 'PRI']);
-        return $this->pkCache[$target] = $stmt->fetchAll(PDO::FETCH_COLUMN);
+        $stmt->execute([$target, 'PRI', 'UNI']);
+
+        $primary = [];
+        $unique = [];
+        foreach ($stmt->fetchAll() as $row) {
+            if ($row['COLUMN_KEY'] === 'PRI') {
+                $primary[] = $row['COLUMN_NAME'];
+            } else {
+                $unique[] = $row['COLUMN_NAME'];
+            }
+        }
+
+        return $this->pkCache[$target] = $primary !== [] ? $primary : $unique;
     }
 
     /** @param list<string> $cols @return list<string> */
     private function nonKeyColumns(string $table, array $cols): array
     {
-        $pk = $this->primaryKeys($table);
+        $pk = $this->identityKeys($table);
         return array_values(array_diff($cols, $pk));
     }
 

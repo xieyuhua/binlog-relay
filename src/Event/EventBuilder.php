@@ -17,11 +17,23 @@ use BinlogRelay\Replication\Event\RowEvent\TableMap;
  */
 final class EventBuilder
 {
-    /** 主键列缓存：tableId => [db\0table, list<string>]，tableId 随 TABLE_MAP 轮换，天然在 DDL 后失效 */
+    /** 幂等键列缓存：tableId => list<column>，tableId 随 TABLE_MAP 轮换，天然在 DDL 后失效 */
     private static array $keyCache = [];
 
-    /** GTID 是否可读：v9 未启用 GTID 时属性未初始化，探测一次后走快路径 */
+    /** 已告警过的无键表，避免每个事件都刷日志 */
+    private static array $warnedTables = [];
+
+    /** 无键表告警回调，由使用方注入（Logger） */
+    private static $warnHandler = null;
+
+    /** GTID 是否可读：未启用 GTID 时属性未初始化，探测一次后走快路径 */
     private static ?bool $gtidReadable = null;
+
+    /** 注入告警回调：遇到既无主键也无唯一键的表时调用一次 */
+    public static function onMissingKey(callable $handler): void
+    {
+        self::$warnHandler = $handler;
+    }
 
     /**
      * @return list<Change>
@@ -90,9 +102,12 @@ final class EventBuilder
     }
 
     /**
-     * 主键列名（来自 information_schema，COLUMN_KEY = PRI）
-     * 按 tableId + 表名缓存，避免每个事件都遍历列集合。
-     * tableId 会随 TABLE_MAP 事件更新，DDL 后自动失效。
+     * 幂等键列名，按优先级回退：
+     *   1. 主键 PRI（联合主键按 information_schema 的列顺序，顺序稳定）
+     *   2. 唯一键 UNI（无主键但有唯一索引时，仍能唯一定位一行）
+     *   3. 空数组（既无主键也无唯一键，由调用方兜底）
+     *
+     * 结果按 tableId + 表名缓存；tableId 会随 TABLE_MAP 事件更新，DDL 后自动失效。
      *
      * @return list<string>
      */
@@ -103,18 +118,35 @@ final class EventBuilder
             return self::$keyCache[$cacheKey];
         }
 
-        $pk = [];
+        $primary = [];
+        $unique = [];
         foreach ($tableMap->columnDTOCollection as $column) {
-            if (strtoupper((string)($column->fieldDTO->columnKey ?? '')) === 'PRI') {
-                $pk[] = $column->getName();
+            $keyType = strtoupper((string)($column->fieldDTO->columnKey ?? ''));
+            if ($keyType === 'PRI') {
+                $primary[] = $column->getName();
+            } elseif ($keyType === 'UNI') {
+                $unique[] = $column->getName();
             }
+        }
+
+        // 主键优先；没有主键时退到唯一键
+        $key = $primary !== [] ? $primary : $unique;
+
+        // 一旦遇到无键表，说明下游幂等会退化，只告警一次以免刷屏
+        if ($key === [] && !isset(self::$warnedTables[$cacheKey])) {
+            self::$warnedTables[$cacheKey] = true;
+            self::$warnHandler !== null && (self::$warnHandler)(
+                sprintf('表 %s.%s 无主键也无唯一键，将按整行内容生成幂等键（性能与准确性下降）',
+                    $tableMap->database, $tableMap->table)
+            );
         }
 
         // 表数量增长时简单裁剪，避免长驻进程无限增长
         if (count(self::$keyCache) > 512) {
             self::$keyCache = [];
+            self::$warnedTables = [];
         }
-        return self::$keyCache[$cacheKey] = $pk;
+        return self::$keyCache[$cacheKey] = $key;
     }
 
     /** GTID 读取：未启用 GTID 时 v9 的属性未初始化，探测一次后固定走快路径 */

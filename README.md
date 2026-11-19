@@ -1097,3 +1097,87 @@ delete demo.orders:333   ✅
 # 手动打包单体入口：
 php -d phar.readonly=0 build/make-phar.php dist/stage-binlog2redis dist/binlog2redis.phar binlog2redis
 ```
+
+---
+
+## 21. SQL 在哪端构建？主键怎么处理？
+
+### 21.1 结论：SQL 在消费端构建
+
+本项目的分工：
+
+```
+解析端（relay / binlog2redis）          消费端（consumer + Sink）
+  读 binlog                                MysqlSink  → INSERT ... ON DUPLICATE KEY UPDATE
+  归一化成 Change（结构化 JSON）            ClickHouseSink → JSONEachRow
+  过滤 / 裁剪列                             ElasticsearchSink → _bulk
+  写 Redis Stream                          HttpSink → 业务接口（对方拼 SQL）
+```
+
+| 维度 | 解析端拼 SQL | 消费端拼 SQL（本项目采用） |
+|---|---|---|
+| 多目标 | 每个下游一套 SQL，解析端要知道所有目标结构 | 每个 consumer 只管自己的目标 |
+| 队列表述 | SQL 文本比 JSON 大 30–80% | 只传结构化数据 |
+| 批量 | 无法感知下游能否合并 | 1000 条合成 1 条 `INSERT ... VALUES (...),(...)` |
+| 列裁剪 | 需要同时考虑所有下游的列需求 | 消费端按需取 |
+| 安全 | SQL 里拼值风险高 | 参数化绑定，天然防注入 |
+| 变更成本 | 改 SQL 要重启解析端 | 只重启对应 consumer |
+
+**例外**：DDL（`QueryDTO` 里的 `ALTER TABLE` / `CREATE TABLE`）属于元数据，
+如果要自动同步目标表结构，应该在消费端执行（或单独的 schema-sync 任务），
+因为只有消费端知道目标库的连接和命名规则。
+
+### 21.2 主键处理：三级回退
+
+`EventBuilder` 按优先级确定幂等键，实测结果：
+
+| 表结构 | `table_key` | `pk` 示例 |
+|---|---|---|
+| 单主键 | `['id']` | `demo.t_single:1` |
+| 联合主键 `(a,b)` | `['a','b']` | `demo.t_multi:1,2` |
+| 仅唯一键 `UNIQUE(code)` | `['code']` | `demo.t_uniq:C1` |
+| 无主键无唯一键 | `[]` | `demo.t_nopk:#5d8e6433a0ac4d8f` |
+
+实现要点：
+
+- **主键优先于唯一键**：两者都存在时用主键。唯一键可能有多个，取 `information_schema`
+  里第一个（`ORDINAL_POSITION` 最小）；需要精确控制时请显式建主键。
+- **联合主键顺序稳定**：按 `information_schema.COLUMNS` 的列顺序拼接，
+  多次解析结果一致，可安全用作幂等键。
+- **无键表退化**：用整行内容的 `sha1` 前 16 位作为键，保证不同行不撞键。
+  `delete` 事件用 `before` 行计算，与对应的 `insert` 结果一致。
+- **只告警一次**：遇到无键表时打一条 WARNING，后续同类表不重复刷日志。
+
+### 21.3 无键表的注意事项
+
+无键表并不是"不能用"，但有这些限制：
+
+| 能力 | 有键表 | 无键表 |
+|---|---|---|
+| Redis Stream 去重 | ✅ | ⚠️ 内容相同的两行会撞键 |
+| MySQL Sink 删除 | 按主键 `IN (...)` 批量删 | **按整行 `WHERE ... LIMIT 1` 逐条删** |
+| ES `_id` | 主键值 | 行哈希（可能撞 ID） |
+| CK ReplacingMergeTree | 主键去重 | 无稳定排序键，重复数据可能残留 |
+
+`MysqlSink` 对无键表的删除实现：
+
+```sql
+DELETE FROM mirror_logs WHERE x <=> ? AND y <=> ? LIMIT 1
+```
+
+- 用 `<=>` 做 NULL 安全比较
+- `LIMIT 1` 避免误删内容完全相同的多行
+- 逐条执行，批次内仍在同一事务里
+
+### 21.4 建议
+
+1. **业务表必须建主键**。没有主键的表在 binlog 场景下无法可靠幂等，
+   这是数据库设计问题，不该用消费端兜底。
+2. **临时表/日志表如果确实没主键**，在配置里排除掉，避免无谓开销：
+   ```php
+   'filter' => ['ignore_tables' => ['tmp_import', 'log_debug']],
+   ```
+3. **只有唯一键的表**可以接受，但要确认唯一键在业务上真的唯一
+   （例如软删除表用 `(code, deleted_at)` 这类复合唯一键可能需要显式建主键）。
+4. **联合主键**完全支持，但下游 ES/CH 的 ID 会变成 `a:b` 形式，
+   需要确认目标字段长度够用。

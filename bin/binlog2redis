@@ -83,6 +83,8 @@ function run_service(array $config, string $command, array $options): void
     $positions = make_positions(make_store($config), $logger, $config);
     $positions->lock();
 
+    BinlogRelay\Event\EventBuilder::onMissingKey(fn(string $msg) => $logger->warning($msg));
+
     $writer = new StreamWriter($config, $logger);
     $writer->boot();
 

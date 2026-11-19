@@ -75,13 +75,33 @@ final readonly class Change
         );
     }
 
-    /** 用于下游幂等的定位键：库.表:主键值 */
+    /**
+     * 用于下游幂等的定位键
+     *
+     * - 有主键/唯一键：库.表:键值1,键值2
+     * - 无键表：库.表:行内容哈希（删除时用 before，其余用 row）
+     *
+     * 无键表的哈希会让"同内容的多行"共用同一个键，这是无主键表的固有限制，
+     * 下游应配合整行匹配（如 MysqlSink 的 row-match 删除）来保证正确性。
+     */
     public function rowIdentity(): string
     {
+        if ($this->tableKey === []) {
+            $source = $this->op === self::DELETE && $this->before !== null ? $this->before : $this->row;
+            $payload = json_encode($source, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE) ?: '';
+            return $this->database . '.' . $this->table . ':#' . substr(sha1($payload), 0, 16);
+        }
+
         $parts = [];
         foreach ($this->tableKey as $col) {
             $parts[] = (string)($this->row[$col] ?? '');
         }
         return $this->database . '.' . $this->table . ':' . implode(',', $parts);
+    }
+
+    /** 是否具备可用于精确定位的键（主键或唯一键） */
+    public function hasKey(): bool
+    {
+        return $this->tableKey !== [];
     }
 }

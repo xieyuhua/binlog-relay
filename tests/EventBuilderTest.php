@@ -20,6 +20,7 @@ use BinlogRelay\Event\Change;
 use BinlogRelay\Event\EventBuilder;
 use BinlogRelay\Replication\BinLog\BinLogCurrent;
 use BinlogRelay\Replication\Definitions\ConstEventType;
+use BinlogRelay\Replication\Definitions\ConstFieldType;
 use BinlogRelay\Replication\Event\DTO\DeleteRowsDTO;
 use BinlogRelay\Replication\Event\DTO\UpdateRowsDTO;
 use BinlogRelay\Replication\Event\DTO\WriteRowsDTO;
@@ -80,6 +81,68 @@ check('insert before 为 null', $changes[0]->before === null);
 check('binlog 位置透传', $changes[0]->binlogPos === '1000' && $changes[0]->binlogFile === 'mysql-bin.000007');
 check('GTID 未初始化时返回空串', $changes[0]->gtid === '');
 check('rowIdentity 可用作幂等键', $changes[0]->rowIdentity() === 'demo.orders:1', $changes[0]->rowIdentity());
+check('有主键时 hasKey 为 true', $changes[0]->hasKey());
+
+// --- 联合主键 ---
+$composite = new TableMap('demo', 'order_items', '43', 3, (function () {
+    $c = new ColumnDTOCollection();
+    $c->add(new ColumnDTO(new FieldDTO('order_id', null, null, '', 'int', 'PRI'), ConstFieldType::LONG, 0, 0, 0, 0, 0, 0, 0, 0));
+    $c->add(new ColumnDTO(new FieldDTO('item_id', null, null, '', 'int', 'PRI'), ConstFieldType::LONG, 0, 0, 0, 0, 0, 0, 0, 0));
+    $c->add(new ColumnDTO(new FieldDTO('qty', null, null, '', 'int', ''), ConstFieldType::LONG, 0, 0, 0, 0, 0, 0, 0, 0));
+    return new ColumnDTOCollection($c->toArray());
+})());
+$dto = new WriteRowsDTO(makeInfo(ConstEventType::WRITE_ROWS_EVENT_V2->value, '2500'), $composite, 1, [
+    ['order_id' => 5, 'item_id' => 9, 'qty' => 2],
+]);
+$changes = EventBuilder::fromRowsDTO($dto);
+check('联合主键两列都识别', $changes[0]->tableKey === ['order_id', 'item_id'], json_encode($changes[0]->tableKey));
+check('联合主键 pk 用逗号连接', $changes[0]->rowIdentity() === 'demo.order_items:5,9', $changes[0]->rowIdentity());
+
+// --- 仅唯一键 ---
+$uniq = new TableMap('demo', 'users', '44', 2, (function () {
+    $c = new ColumnDTOCollection();
+    $c->add(new ColumnDTO(new FieldDTO('id', null, null, '', 'int', ''), ConstFieldType::LONG, 0, 0, 0, 0, 0, 0, 0, 0));
+    $c->add(new ColumnDTO(new FieldDTO('code', null, null, '', 'varchar(20)', 'UNI'), ConstFieldType::VARCHAR, 0, 0, 0, 0, 0, 0, 0, 0));
+    return new ColumnDTOCollection($c->toArray());
+})());
+$dto = new WriteRowsDTO(makeInfo(ConstEventType::WRITE_ROWS_EVENT_V2->value, '2600'), $uniq, 1, [
+    ['id' => 1, 'code' => 'C1'],
+]);
+$changes = EventBuilder::fromRowsDTO($dto);
+check('无主键时回退到唯一键', $changes[0]->tableKey === ['code'], json_encode($changes[0]->tableKey));
+check('唯一键可作幂等键', $changes[0]->rowIdentity() === 'demo.users:C1', $changes[0]->rowIdentity());
+
+// --- 无主键无唯一键 ---
+$nokey = new TableMap('demo', 'logs', '45', 2, (function () {
+    $c = new ColumnDTOCollection();
+    $c->add(new ColumnDTO(new FieldDTO('x', null, null, '', 'int', ''), ConstFieldType::LONG, 0, 0, 0, 0, 0, 0, 0, 0));
+    $c->add(new ColumnDTO(new FieldDTO('y', null, null, '', 'int', ''), ConstFieldType::LONG, 0, 0, 0, 0, 0, 0, 0, 0));
+    return new ColumnDTOCollection($c->toArray());
+})());
+$warned = null;
+EventBuilder::onMissingKey(function (string $msg) use (&$warned) { $warned = $msg; });
+$dtoA = new WriteRowsDTO(makeInfo(ConstEventType::WRITE_ROWS_EVENT_V2->value, '2700'), $nokey, 2, [
+    ['x' => 1, 'y' => 2],
+    ['x' => 3, 'y' => 4],
+]);
+$changes = EventBuilder::fromRowsDTO($dtoA);
+check('无键表 tableKey 为空', $changes[0]->tableKey === []);
+check('无键表 hasKey 为 false', !$changes[0]->hasKey());
+check('无键表 pk 退化为行哈希', str_starts_with($changes[0]->rowIdentity(), 'demo.logs:#'), $changes[0]->rowIdentity());
+check('不同行生成不同 pk', $changes[0]->rowIdentity() !== $changes[1]->rowIdentity());
+check('无键表触发一次告警', is_string($warned) && str_contains($warned, 'demo.logs'), (string)$warned);
+
+$warnCount = 0;
+EventBuilder::onMissingKey(function () use (&$warnCount) { $warnCount++; });
+// 同一张表再出现，不应重复告警
+EventBuilder::fromRowsDTO(new WriteRowsDTO(makeInfo(ConstEventType::WRITE_ROWS_EVENT_V2::class ? ConstEventType::WRITE_ROWS_EVENT_V2->value : 0, '2800'), $nokey, 1, [['x' => 9, 'y' => 9]]));
+check('同一无键表只告警一次', $warnCount === 0, (string)$warnCount);
+
+// delete 用 before 计算时与 insert 一致
+$delChanges = EventBuilder::fromRowsDTO(new DeleteRowsDTO(
+    makeInfo(ConstEventType::DELETE_ROWS_EVENT_V2->value, '2900'), $nokey, 1, [['x' => 1, 'y' => 2]]
+));
+check('无键表 insert 与 delete 的 pk 一致', $delChanges[0]->rowIdentity() === 'demo.logs:#' . substr(sha1(json_encode(['x'=>1,'y'=>2], JSON_UNESCAPED_UNICODE)), 0, 16));
 
 // --- update before/after ---
 $dto = new UpdateRowsDTO(makeInfo(ConstEventType::UPDATE_ROWS_EVENT_V2->value, '2000'), makeTableMap(), 1, [
