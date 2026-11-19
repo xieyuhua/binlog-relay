@@ -86,17 +86,25 @@ final readonly class Change
      */
     public function rowIdentity(): string
     {
+        $prefix = $this->database . '.' . $this->table . ':';
+
+        // 无键表：用行内容哈希
         if ($this->tableKey === []) {
             $source = $this->op === self::DELETE && $this->before !== null ? $this->before : $this->row;
             $payload = json_encode($source, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE) ?: '';
-            return $this->database . '.' . $this->table . ':#' . substr(sha1($payload), 0, 16);
+            return $prefix . '#' . substr(sha1($payload), 0, 16);
+        }
+
+        // 单主键是最常见的情况（绝大多数业务表），跳过循环与 implode
+        if (count($this->tableKey) === 1) {
+            return $prefix . ($this->row[$this->tableKey[0]] ?? '');
         }
 
         $parts = [];
         foreach ($this->tableKey as $col) {
-            $parts[] = (string)($this->row[$col] ?? '');
+            $parts[] = $this->row[$col] ?? '';
         }
-        return $this->database . '.' . $this->table . ':' . implode(',', $parts);
+        return $prefix . implode(',', $parts);
     }
 
     /** 是否具备可用于精确定位的键（主键或唯一键） */
