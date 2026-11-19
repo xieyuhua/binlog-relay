@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace BinlogRelay\Relay;
 
 use BinlogRelay\Checkpoint\PositionManager;
+use BinlogRelay\Event\ColumnProjector;
 use BinlogRelay\Event\EventBuilder;
 use BinlogRelay\Event\Filter;
 use BinlogRelay\Handler\HandlerChain;
@@ -37,6 +38,7 @@ final class Subscriber extends EventSubscribers
         private readonly PositionManager $positions,
         private readonly Logger $logger,
         private readonly int $batchSize = 200,
+        private readonly ?ColumnProjector $projector = null,
     ) {
         $this->lastFlushAt = microtime(true);
     }
@@ -95,6 +97,10 @@ final class Subscriber extends EventSubscribers
         }
 
         $changes = EventBuilder::fromRowsDTO($dto);
+        // 列裁剪在入缓冲前完成：省内存、也省后续 JSON 编码与队列体积
+        if ($this->projector !== null) {
+            $changes = $this->projector->apply($changes);
+        }
         foreach ($changes as $change) {
             $this->buffer[] = $change;
         }

@@ -748,3 +748,144 @@ CONSUMER_STREAM=topic:search php bin/consumer status
 
 `MultiStreamHandler` 的实测开销：一条变更命中 4 个 topic 时，多出 3 次 XADD 的 CPU 开销，
 但因为走同一个 pipeline，网络往返仍是 1 次，整体吞吐相比单 topic 下降约 10–15%。
+
+---
+
+## 17. 列裁剪（丢弃不需要的字段）
+
+binlog 行事件默认带整行数据，大字段（TEXT/BLOB/JSON）往往占消息体积的 90% 以上，
+而业务可能只需要 `id` + `status`。在**入队前**裁掉不需要的列，能同时降低队列内存、
+网络传输、消费端 JSON 解析和下游写入成本。
+
+### 17.1 配置
+
+`config/relay.php`：
+
+```php
+'filter' => [
+    'columns' => [
+        // 订单表只要这几列
+        'orders' => ['id', 'status', 'amount', 'updated_at'],
+
+        // 文章表丢掉 content 大字段
+        'cms_article' => ['id', 'title', 'status', 'updated_at'],
+
+        // 其余表只要主键（适合只关心"有没有变"的场景）
+        '*' => ['id'],
+    ],
+],
+```
+
+规则：
+
+| 项 | 说明 |
+|---|---|
+| 未配置的表 | 原样保留全部列 |
+| `'*'` | 作为兜底，作用于所有未显式配置的表 |
+| 主键列 | **永远保留**，即使没写进配置（否则下游无法幂等） |
+| `before` 行 | 同样裁剪；下游做字段 diff 时注意被裁掉的列不会出现 |
+| 空配置 | 完全不生效，零开销（验证见 `tests/ProjectorTest.php`） |
+
+### 17.2 实测收益
+
+| 行数据 | 完整体积 | 裁剪后 | 保留比例 |
+|---|---|---|---|
+| 窄表（8 列） | 103 B | 44 B | 43% |
+| 含 TEXT（~8KB） | 24,089 B | 24,089 B | 100%（该列在保留列表里） |
+| 含 BLOB（20KB） | 20,072 B | 60 B | **0.3%** |
+| 含 JSON（600B） | 600 B | 44 B | 7% |
+
+结论：**含大字段的表收益最大**。如果一张表有 `content`/`avatar`/`meta` 这类列，
+只要业务不需要，裁掉后队列体积能降两个数量级。
+
+### 17.3 注意事项
+
+- 裁剪发生在 relay 侧，**所有** handler/topic 拿到的都是裁剪后的数据。如果不同业务需要不同列，
+  有两种做法：
+  1. 取所有业务的并集（简单，但队列体积由最宽的业务决定）
+  2. 分多个 relay 实例，各自配置不同的 `columns`（隔离彻底，成本更高）
+- 下游如果依赖 `before` 做字段级 diff，裁剪后只能看到保留列的差异
+- 列裁剪不影响 `pk` / `pos` / `tableKey`，幂等键始终完整
+
+---
+
+## 18. 每个业务独立解析 binlog 是否更快？
+
+**结论：通常不会更快，反而更慢；但在少数场景下值得做。** 下面是依据。
+
+### 18.1 为什么"多实例各自解析"不划算
+
+binlog 复制协议是**串行流**，每个实例都是一个独立的从库连接：
+
+| 成本项 | 单实例 | N 个实例 |
+|---|---|---|
+| MySQL 侧连接 | 1 个 dump 线程 | N 个 dump 线程，每个都要维护 binlog 缓存 |
+| 网络传输 | binlog 只传一遍 | **binlog 传 N 遍**（这是最大头，尤其大字段多时） |
+| 解析 CPU | 解析一遍 | 解析 N 遍，但**每个实例只解析自己关心的表**，可用 `RELAY_TABLES` 过滤 |
+| 内存 | 一份 table cache | N 份 |
+| 运维 | 1 个点位 | N 个点位，N 个故障点 |
+
+关键在于第二行：**binlog 从主库读出来是通过网络传输的**。一个实例里做扇出（`MultiStreamHandler`），
+binlog 只传一次；N 个实例则是 N 倍传输。如果 binlog 里大字段多、写入量大，这个成本非常可观。
+
+另外，krowinski 库的 `withTablesOnly()` 过滤是在 **TABLE_MAP 解析阶段**生效的——
+命中过滤的表，连 `information_schema` 查询和行数据解码都会跳过。
+但**字节仍然要从网络读入**，所以过滤只省 CPU，不省带宽。
+
+### 18.2 什么时候确实该拆多个实例
+
+| 场景 | 建议 |
+|---|---|
+| 某些业务对延迟极敏感（订单），其余可容忍秒级 | 拆分：关键业务单实例 + `RELAY_TABLES` 只订阅关键表 |
+| 总量超过单实例处理能力（实测 > 6–7k events/s） | 拆分：按表分片，各实例订阅不同表集合 |
+| 需要不同裁剪规则（A 业务要全字段，B 只要主键） | 拆分：各自配置 `filter.columns` |
+| 需要独立发布/重启（一个业务改动不影响其它） | 拆分：进程级隔离 |
+| 只是想让不同业务互不影响队列 | **不必拆分**，用 `MultiStreamHandler` 分 topic 即可 |
+
+### 18.3 实测参考
+
+| 场景 | 相对吞吐 | 说明 |
+|---|---|---|
+| 单实例 + 4 topic 扇出 | ~85–90% | 多 3 次 XADD，仍是一次 pipeline（实测口径有限，以实际压测为准） |
+| 单实例 + 列裁剪 | 与不裁剪持平或略快 | 收益主要在下游和网络，不在 relay CPU |
+| N 个实例各自解析 | 主库侧负载 ×N | 每个实例都要一份 binlog 网络传输 |
+| N 个实例各自订阅不同表 | 每个实例 CPU 下降 | 字节仍要从网络读入，带宽不省 |
+
+### 18.4 推荐的默认架构
+
+```
+                    ┌─ 关键业务 relay（RELAY_TABLES=orders,order_items）
+                    │      └─ topic:order ──► 订单消费端
+MySQL ──binlog──► 1 个 relay
+                    │      └─ MultiStreamHandler 扇出
+                    └─ 其它业务 topic（库存/搜索/审计）
+                           └─ topic:stock / topic:search / topic:audit
+```
+
+**先单实例 + 扇出，遇到下面任一情况再拆：**
+
+1. 单个 relay 的 CPU 持续 > 70%（用 `top` 看）
+2. 端到端延迟（`pos` 时间戳 vs 消费时间）持续超过业务 SLA
+3. 不同业务对列裁剪的需求冲突到无法取并集
+4. 需要独立发布窗口
+
+拆分时用 `RELAY_TABLES` 让每个实例只订阅自己的表，能把 CPU 降下来；
+带宽仍然会翻倍，所以拆分数量控制在 2–3 个为宜。
+
+### 18.5 如果真要拆分，怎么配
+
+```bash
+# 实例 1：订单（关键路径）
+RELAY_TABLES=orders,order_items RELAY_SLAVE_ID=8801 \
+RELAY_CHECKPOINT_KEY=relay:orders php bin/relay start
+
+# 实例 2：其它业务
+RELAY_TABLES=stock,stock_log,products RELAY_SLAVE_ID=8802 \
+RELAY_CHECKPOINT_KEY=relay:catalog php bin/relay start
+```
+
+要点：
+
+- `RELAY_SLAVE_ID` **必须不同**，否则 MySQL 会认为两个从库是同一个，可能互相踢掉
+- `RELAY_CHECKPOINT_KEY` 必须不同，各自维护自己的点位
+- 表集合不要重叠，否则同一变更会被写入两次（下游需幂等）

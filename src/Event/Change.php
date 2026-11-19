@@ -52,6 +52,29 @@ final readonly class Change
         ];
     }
 
+    /**
+     * 替换行数据（列裁剪用）
+     *
+     * @param array<string,mixed>      $row
+     * @param array<string,mixed>|null $before
+     */
+    public function withRows(array $row, ?array $before): self
+    {
+        return new self(
+            $this->op,
+            $this->database,
+            $this->table,
+            $row,
+            $before,
+            $this->tableKey,
+            $this->binlogFile,
+            $this->binlogPos,
+            $this->gtid,
+            $this->timestamp,
+            $this->serverId
+        );
+    }
+
     /** 用于下游幂等的定位键：库.表:主键值 */
     public function rowIdentity(): string
     {

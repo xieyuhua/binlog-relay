@@ -32,6 +32,15 @@ return [
         'tables'    => csv(env('RELAY_TABLES', '')),
         'ignore_databases' => csv(env('RELAY_IGNORE_DATABASES', 'mysql,sys,information_schema,performance_schema')),
         'ignore_tables'    => csv(env('RELAY_IGNORE_TABLES', '')),
+
+        // 列裁剪：只保留业务需要的列，其余在入队前丢弃
+        // 收益：队列体积、网络传输、消费端解析、下游写入全面下降
+        // 注意：主键列永远保留；before 行同样会被裁剪
+        'columns' => [
+            // 'orders' => ['id', 'status', 'amount', 'updated_at'],   // 只保留这几列
+            // 'cms_article' => ['id', 'title', 'status'],             // 丢掉 content 大字段
+            // '*' => ['id'],                                          // 其余表只要主键
+        ],
     ],
 
     // ---------- 点位存储 ----------

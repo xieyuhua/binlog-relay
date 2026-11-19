@@ -12,6 +12,7 @@ $tests = [
     'EventBuilder 行展开' => __DIR__ . '/EventBuilderTest.php',
     'Handler 链路' => __DIR__ . '/HandlerTest.php',
     '队列消息与消费端' => __DIR__ . '/ConsumerTest.php',
+    '列裁剪' => __DIR__ . '/ProjectorTest.php',
 ];
 
 $failed = 0;

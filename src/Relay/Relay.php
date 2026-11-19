@@ -8,6 +8,7 @@ use BinlogRelay\Checkpoint\Checkpoint;
 use BinlogRelay\Checkpoint\FileStore;
 use BinlogRelay\Checkpoint\PositionManager;
 use BinlogRelay\Checkpoint\RedisStore;
+use BinlogRelay\Event\ColumnProjector;
 use BinlogRelay\Event\Filter;
 use BinlogRelay\Handler\HandlerChain;
 use BinlogRelay\Support\Logger;
@@ -56,12 +57,20 @@ final class Relay
         $this->handlers->build($this->config['handlers'] ?? []);
 
         $filter = Filter::fromConfig($this->config['filter'] ?? []);
+        $projector = null;
+        $columnCfg = $this->config['filter']['columns'] ?? [];
+        if (is_array($columnCfg) && $columnCfg !== []) {
+            $projector = ColumnProjector::fromConfig($columnCfg);
+            $this->logger->info('列裁剪已启用，配置表数：' . count($columnCfg));
+        }
+
         $this->subscriber = new Subscriber(
             $this->handlers,
             $filter,
             $this->positions,
             $this->logger,
-            (int)($this->config['batch_size'] ?? 200)
+            (int)($this->config['batch_size'] ?? 200),
+            $projector
         );
     }
 
