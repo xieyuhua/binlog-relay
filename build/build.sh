@@ -3,15 +3,17 @@
 # 打包为单文件二进制（PHP 代码 phar + 静态 PHP 运行时 micro.sfx）
 #
 # 依赖：
-#   1. composer
-#   2. static-php-cli 的 spc（https://static-php.dev）
-#   3. 已用 spc 构建好的 micro.sfx（需含 relay 用到的扩展）
+#   1. composer（仅用于生成 autoload，项目本身零第三方包）
+#   2. 一个现成的 micro.sfx 运行时（放到 build/micro.sfx，或用 MICRO_SFX 指定）
+#
+# 不需要 spc：合成逻辑由 build/micro-combine.php 用纯 PHP 实现，
+# 格式与 spc 的 micro:combine 完全一致。
 #
 # 用法：
-#   ./build/build.sh              # 同时生成 dist/relay 和 dist/consumer
-#   ./build/build.sh relay        # 只打生产端
-#   ./build/build.sh consumer     # 只打消费端
-#   SPC=/path/to/spc ./build/build.sh
+#   ./build/build.sh                    # 同时生成 dist/relay 和 dist/consumer
+#   ./build/build.sh relay              # 只打生产端
+#   ./build/build.sh consumer           # 只打消费端
+#   MICRO_SFX=/path/to/micro.sfx ./build/build.sh
 #
 # 没有 micro.sfx 时仍会生成 phar，可直接 `php dist/relay.phar start` 运行。
 #
@@ -19,16 +21,23 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/dist"
-SPC="${SPC:-spc}"
 MICRO_SFX="${MICRO_SFX:-$ROOT/build/micro.sfx}"
 TARGET="${1:-all}"
 
-echo "==> 1/6 清理与安装生产依赖"
+# 注入到二进制里的运行时 ini（可按需增删）
+INI_FLAGS=(
+  --ini="memory_limit=512M"
+  --ini="display_errors=stderr"
+  --ini="log_errors=1"
+  --ini="error_reporting=E_ALL & ~E_DEPRECATED"
+)
+
+echo "==> 1/4 清理与准备依赖"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 composer install --no-dev --classmap-authoritative --no-interaction --working-dir="$ROOT" --quiet
 
-# 准备一份公共 stage（src/config/vendor），两个入口共用
+# 公共 stage（src/config/vendor），三个入口共用
 STAGE_BASE="$DIST/stage-base"
 mkdir -p "$STAGE_BASE"
 cp -r "$ROOT/src" "$ROOT/config" "$ROOT/vendor" "$STAGE_BASE/"
@@ -36,10 +45,10 @@ mkdir -p "$STAGE_BASE/var"
 find "$STAGE_BASE" -name '.env' -delete
 find "$STAGE_BASE/var" -type f -delete
 
-echo "==> 2/6 生成 phar"
+echo "==> 2/4 生成 phar 并合成二进制"
 build_one() {
-  local name="$1"      # relay | consumer
-  local entry="$2"     # relay.php | consumer.php
+  local name="$1"      # relay | consumer | binlog2redis
+  local entry="$2"     # relay.php | consumer.php | binlog2redis.php
   local stage="$DIST/stage-$name"
 
   cp -r "$STAGE_BASE" "$stage"
@@ -55,36 +64,46 @@ build_one() {
   fi
 
   local out="$DIST/$name"
-  "$SPC" micro:combine "$phar" \
-    --with-micro="$MICRO_SFX" \
-    --output="$out" \
-    -I "memory_limit=512M" \
-    -I "display_errors=stderr" \
-    -I "log_errors=1" \
-    -I "error_reporting=E_ALL & ~E_DEPRECATED" >/dev/null
-  chmod +x "$out"
-  echo "    -> $out ($(du -h "$out" | cut -f1))"
+  php "$ROOT/build/micro-combine.php" "$phar" "$out" \
+    --micro="$MICRO_SFX" "${INI_FLAGS[@]}" | sed 's/^/    /'
 }
 
+echo "==> 3/4 打包入口"
 case "$TARGET" in
-  relay)    build_one relay relay.php ;;
-  consumer) build_one consumer consumer.php ;;
-  all)      build_one relay relay.php; build_one consumer consumer.php ;;
-  *)        echo "未知目标：$TARGET（可选 relay / consumer / all）"; exit 1 ;;
+  relay)         build_one relay relay.php ;;
+  consumer)      build_one consumer consumer.php ;;
+  binlog2redis)  build_one binlog2redis binlog2redis.php ;;
+  all)
+    build_one relay relay.php
+    build_one consumer consumer.php
+    build_one binlog2redis binlog2redis.php
+    ;;
+  *)
+    echo "未知目标：$TARGET（可选 relay / consumer / binlog2redis / all)"
+    exit 1
+    ;;
 esac
 
 rm -rf "$STAGE_BASE"
 
-echo
-echo "==> 完成，产物在 $DIST"
+echo "==> 4/4 完成，产物在 $DIST"
+ls -lh "$DIST" | grep -vE '^total|stage' || true
+
 if [[ ! -f "$MICRO_SFX" ]]; then
   cat <<EOF
 
-要生成单文件二进制，先在能编译的机器上构建 micro.sfx：
+未找到 micro.sfx，只生成了 phar（可直接用系统 PHP 运行）：
+  php dist/relay.phar status
 
-  spc build:php "sockets,bcmath,pdo_mysql,phar,pcntl,posix,redis" --build-micro
-  cp buildroot/bin/micro.sfx build/micro.sfx
+要生成单文件二进制，请准备一个 micro.sfx（含以下扩展）：
+  sockets, bcmath, json, phar, pdo_mysql, redis, pcntl, posix
 
-消费端若使用 mysql sink，同样需要 pdo_mysql；使用 redis 点位/队列需要 redis 扩展。
+获取方式（任选其一）：
+  A. 从 https://github.com/crazywhalecc/static-php-cli/releases 下载预编译版本
+  B. 在自己的机器上用 spc 构建一次（只需一次，之后打包不再需要 spc）：
+       spc build:php "sockets,bcmath,pdo_mysql,phar,pcntl,posix,redis" --build-micro
+       cp buildroot/bin/micro.sfx build/micro.sfx
+
+然后重新执行 ./build/build.sh 即可。
 EOF
 fi

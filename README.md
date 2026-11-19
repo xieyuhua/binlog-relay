@@ -18,7 +18,7 @@
 
 特点：
 
-- **单文件部署**：`spc micro:combine` 打成 ~30MB 的可执行文件，目标机器不用装 PHP
+- **单文件部署**：phar + micro.sfx 合成可执行文件，目标机器不用装 PHP，打包也不需要 spc
 - **点位零丢失**：Redis 原子 hash / 文件原子 rename，批量落盘降低 IO
 - **单实例互斥**：Redis `SET NX PX` 或 `flock`，避免两个进程重复消费
 - **背压可控**：按事务批量提交，handler 抛异常即停，点位停在上一批
@@ -292,52 +292,88 @@ php bin/relay reset-position --force   # 从最新 binlog 末尾重新开始
 
 与 webman 的方式一致：**PHP 代码打成 phar + 静态 PHP 运行时（micro.sfx）合成一个可执行文件**。
 
-### 9.1 构建运行时（只有在准备 micro.sfx 时做一次）
+### 9.1 准备运行时（只需一个 micro.sfx，**不需要 spc**）
+
+`micro.sfx` 是静态编译的 PHP 解释器，只需拿到文件即可，打包时不再依赖 spc。
 
 ```bash
-# 下载 spc（Linux x86_64 示例）
+# 方式 A：直接下载预编译版（推荐，选含所需扩展的 micro.sfx）
+#   https://github.com/crazywhalecc/static-php-cli/releases
+cp /path/to/micro.sfx build/micro.sfx
+
+# 方式 B：自己构建一次（只有这一步需要 spc，之后打包不再需要）
 curl -fsSL -o spc https://dl.static-php.dev/static-php-cli/spc-bin/nightly/spc-linux-x86_64
 chmod +x spc
-
-# 构建带所需扩展的 micro 运行时
 ./spc build:php "sockets,bcmath,pdo_mysql,phar,pcntl,posix,redis" --build-micro
 cp buildroot/bin/micro.sfx build/micro.sfx
 ```
 
-> `sockets` 是必须的（binlog 复制协议走原生 socket），`bcmath` 是库要求的，`redis` 只有用 Redis 点位时才需要。
-> Windows 构建需要 VS2022，且不能动态加载扩展，所有扩展必须静态编入。
+micro.sfx 必须包含：`sockets`（binlog 协议走原生 socket，必需）、`bcmath`、`json`、`phar`、
+`pdo_mysql`（读表结构）、`redis`（队列与点位）、`pcntl`/`posix`（优雅退出，可选）。
+
+> Windows 上的 micro.sfx 不能动态加载扩展，所有扩展必须静态编入。
 
 ### 9.2 打包
 
-**生产端与消费端可以分别打包**，各自一个单文件，互不依赖：
-
 ```bash
-MICRO_SFX=build/micro.sfx ./build/build.sh            # 两个都打
-MICRO_SFX=build/micro.sfx ./build/build.sh relay      # 只打生产端
-MICRO_SFX=build/micro.sfx ./build/build.sh consumer   # 只打消费端
+./build/build.sh                    # 三个入口全打
+./build/build.sh relay              # 只打生产端
+./build/build.sh consumer           # 只打消费端
+./build/build.sh binlog2redis       # 只打单体服务
+MICRO_SFX=/path/to/micro.sfx ./build/build.sh   # 指定其它位置的 micro.sfx
 ```
 
 产物：
 
 ```
-dist/relay      生产端二进制（含 relay.phar）
-dist/consumer   消费端二进制（含 consumer.phar）
+dist/relay          生产端二进制
+dist/consumer       消费端二进制
+dist/binlog2redis   单体服务二进制
+dist/*.phar         对应的 phar（无 micro.sfx 时只有这个）
 ```
 
-没有 `micro.sfx` 时脚本仍会生成 phar，可直接用系统 PHP 运行（适合先验证逻辑）：
+没有 `micro.sfx` 时脚本仍会生成 phar，可直接用系统 PHP 运行：
 
 ```bash
 php dist/relay.phar status
-php dist/consumer.phar check
+php dist/binlog2redis.phar check
 ```
 
 脚本做的事：
 
-1. `composer install --no-dev --classmap-authoritative`
-2. 收集 `src/ config/ vendor/` 到公共 stage（两个入口共用，只做一次）
-3. `build/make-phar.php <stage> <phar> <entry>` 分别打出 `relay.phar` / `consumer.phar`
-4. `spc micro:combine` 合成可执行文件（有 micro.sfx 时）
+1. `composer install --no-dev --classmap-authoritative`（只为生成 autoload）
+2. 收集 `src/ config/ vendor/` 到公共 stage（三个入口共用，只做一次）
+3. `build/make-phar.php <stage> <phar> <entry>` 打出各自的 phar
+4. `build/micro-combine.php` 把 micro.sfx + ini + phar 拼成一个文件（纯 PHP，无 spc）
 5. 注入 ini：`memory_limit=512M`、`error_reporting=E_ALL & ~E_DEPRECATED` 等
+
+### 9.2.1 合成格式（为什么不需要 spc）
+
+`spc micro:combine` 做的事其实只是字节拼接，格式如下：
+
+```
+[ micro.sfx 原始内容 ]
+[ 可选 ini 段：\xfd\xf6\x69\xe6 + uint32 大端长度 + ini 文本 ]
+[ phar 或 php 脚本内容 ]
+```
+
+`build/micro-combine.php` 用 30 行 PHP 实现了同样的逻辑，因此**打包环节不再依赖 spc**：
+
+```bash
+# 也可以单独调用
+php build/micro-combine.php dist/relay.phar dist/relay \
+    --micro=build/micro.sfx \
+    --ini="memory_limit=512M" \
+    --ini="display_errors=stderr"
+```
+
+验证合成结果是否正确：
+
+```bash
+# 检查 ini 段魔数与内容
+php -r '$d=file_get_contents("dist/relay");$p=strpos($d,"\xfd\xf6\x69\xe6");
+$n=unpack("N",substr($d,$p+4,4))[1];echo "sfx长度=$p\n";echo substr($d,$p+8,$n),"\n";'
+```
 
 两个入口的 phar stub 指向不同 `entryFile`（`relay.php` / `consumer.php`），
 所以 `./consumer status` 和 `./relay status` 是两套独立命令，不会混淆。
