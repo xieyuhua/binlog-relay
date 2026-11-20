@@ -23,10 +23,11 @@ final class CheckpointCommand
             echo "尚无点位（{$emptyHint}）\n";
             return;
         }
-        if ($cp->isGtidMode()) {
-            echo 'GTID：' . $cp->gtid . "\n";
-        }
+        // 续传用的是 file+pos；GTID 仅作参考（它是最后一个事务，不是执行集合）
         echo "binlog：{$cp->binlogFile}:{$cp->binlogPos}\n";
+        if ($cp->gtid !== '') {
+            echo "最后事务 GTID：{$cp->gtid}（仅供参考，不用于续传）\n";
+        }
         echo '最后更新：' . ($cp->updatedAt ? date('Y-m-d H:i:s', $cp->updatedAt) : '-') . "\n";
         echo "累计事件：{$cp->events}\n";
         echo "持有者：{$cp->owner}\n";

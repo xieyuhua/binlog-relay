@@ -1238,3 +1238,73 @@ DELETE FROM mirror_logs WHERE x <=> ? AND y <=> ? LIMIT 1
    （例如软删除表用 `(code, deleted_at)` 这类复合唯一键可能需要显式建主键）。
 4. **联合主键**完全支持，但下游 ES/CH 的 ID 会变成 `a:b` 形式，
    需要确认目标字段长度够用。
+
+---
+
+## 22. 恢复策略：为什么默认用 file+pos 而不是 GTID
+
+### 22.1 一个真实故障
+
+```
+[INFO] 从已保存点位恢复：mysql-bin.000028:2639136
+错误：The slave is connecting using CHANGE MASTER TO MASTER_AUTO_POSITION = 1,
+     but the master has purged binary logs containing GTIDs that the slave requires.
+     The GTID set sent by the slave is 'c8fbcbb8-...:2901',
+     and the missing transactions are 'c8fbcbb8-...:1-4'.
+```
+
+日志明明显示按 `file:pos` 恢复，MySQL 却报 GTID 错误。原因是点位里
+`binlogFile` 和 `gtid` **同时有值**，旧逻辑 `isGtidMode()` 只看 gtid 非空，
+于是错误地走了 GTID 分支。
+
+更根本的问题：`gtid` 字段存的是 **binlog 事件里的单个 GTID**（`uuid:2901`），
+表示「最后处理的那个事务」，而 `COM_BINLOG_DUMP_GTID` 需要的是 **完整执行集合**
+（如 `uuid:1-2901`）。把单个事务当执行集合发给主库，必然失败。
+
+### 22.2 修复后的规则
+
+```php
+// Checkpoint
+public function hasFilePosition(): bool      // binlogFile !== ''
+public function shouldResumeByGtid(): bool    // !hasFilePosition() && gtid !== ''
+```
+
+| 点位状态 | 恢复方式 |
+|---|---|
+| 有 `binlogFile` | **file+pos**（默认，精确可靠） |
+| 无 `binlogFile`，有 `gtid` | 回退 GTID，并打 WARNING |
+| 都没有 | 从当前最新 binlog 末尾开始 |
+
+`gtid` 保留在点位里仅作参考（`relay status` 会显示「仅供参考，不用于续传」）。
+
+### 22.3 为什么 file+pos 更可靠
+
+| | file+pos | GTID |
+|---|---|---|
+| 精确性 | 字节级精确 | 事务级，可能有间隙 |
+| 依赖 | 主库保留对应 binlog 文件 | 需完整累积执行集合 |
+| 本项目实现 | 每次事件直接读 `BinLogCurrent` | 只能拿到单事务 GTID |
+| 主库清理日志后 | 报错，需重置点位 | 同样报错 |
+
+真正做到 GTID 恢复需要维护**累积集合**（把每个 GTID 合入 `uuid:1-2901` 形式），
+成本和出错面都更大。对「单实例、单个 binlog 文件内的续传」场景，file+pos
+已经完全够用，且更容易排查。
+
+### 22.4 遇到 "master has purged binary logs" 怎么处理
+
+说明点位指向的 binlog 文件已被主库清理（`expire_logs_days`）。两个选择：
+
+```bash
+# 1. 从当前最新位置重新开始（会跳过期间的数据变化）
+php bin/binlog2redis reset-position --force
+
+# 2. 用全量同步 + 增量：先做一次数据快照，再从快照时刻的 binlog 位置启动
+```
+
+预防措施：`expire_logs_days` 要大于「服务可能停机的最长时间」：
+
+```ini
+[mysqld]
+expire_logs_days = 7          # 至少能覆盖一次周末
+max_binlog_size  = 512M
+```

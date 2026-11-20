@@ -62,14 +62,17 @@ final class Connector
             $builder = $builder->withTablesOnly($tables);
         }
 
-        // 点位恢复
+        // 点位恢复：优先 file+pos。
+        // 事件里的 gtid 只是「最后处理的事务」（如 uuid:2901），不是已执行集合，
+        // 拿它去 COM_BINLOG_DUMP_GTID 会被主库拒绝（master has purged binary logs）。
         if ($checkpoint !== null) {
-            if ($checkpoint->isGtidMode()) {
-                $builder = $builder->withGtid($checkpoint->gtid);
-            } elseif ($checkpoint->binlogFile !== '') {
+            if ($checkpoint->hasFilePosition()) {
                 $builder = $builder
                     ->withBinLogFileName($checkpoint->binlogFile)
                     ->withBinLogPosition($checkpoint->binlogPos);
+            } elseif ($checkpoint->shouldResumeByGtid()) {
+                $builder = $builder->withGtid($checkpoint->gtid);
+                $logger->warning('点位无 binlog 文件名，回退到 GTID 恢复；若主库已清理日志会启动失败');
             }
             $logger->info('从已保存点位恢复：' . self::describe($checkpoint));
         } else {
@@ -92,7 +95,7 @@ final class Connector
 
     public static function describe(Checkpoint $checkpoint): string
     {
-        return $checkpoint->binlogFile !== ''
+        return $checkpoint->hasFilePosition()
             ? $checkpoint->binlogFile . ':' . $checkpoint->binlogPos
             : 'GTID ' . $checkpoint->gtid;
     }

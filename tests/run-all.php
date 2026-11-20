@@ -13,6 +13,7 @@ $tests = [
     'Handler 链路' => __DIR__ . '/HandlerTest.php',
     '队列消息与消费端' => __DIR__ . '/ConsumerTest.php',
     '列裁剪' => __DIR__ . '/ProjectorTest.php',
+    '点位恢复策略' => __DIR__ . '/CheckpointResumeTest.php',
 ];
 
 $failed = 0;
