@@ -15,6 +15,7 @@ $tests = [
     '列裁剪' => __DIR__ . '/ProjectorTest.php',
     '点位恢复策略' => __DIR__ . '/CheckpointResumeTest.php',
     '权限解析' => __DIR__ . '/GrantParseTest.php',
+    'Redis API 契约' => __DIR__ . '/RedisApiTest.php',
 ];
 
 $failed = 0;

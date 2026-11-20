@@ -12,8 +12,14 @@ use RedisException;
  */
 final class RedisStreamClient implements StreamInterface
 {
+    /** xReadGroup 是否支持 block 参数（老版本 phpredis 只接受 4 个） */
+    private readonly bool $supportsBlock;
+
     public function __construct(private readonly Redis $redis)
     {
+        // 用反射探测一次，避免在生产循环里靠异常兜底
+        $this->supportsBlock = (new \ReflectionMethod(Redis::class, 'xReadGroup'))
+            ->getNumberOfParameters() >= 5;
     }
 
     public function redis(): Redis
@@ -35,7 +41,13 @@ final class RedisStreamClient implements StreamInterface
 
     public function readGroup(string $stream, string $group, string $consumer, int $count, int $blockMs): ?array
     {
-        $res = $this->redis->xReadGroup($group, $consumer, [$stream => '>'], 1, $count, $blockMs);
+        // phpredis 签名：xReadGroup(group, consumer, streams, count, block)
+        // 注意：没有命令行 XREADGROUP 里那个 "STREAMS <count>" 参数，传 6 个会报
+        // "expects at most 5 arguments"
+        $res = $this->supportsBlock
+            ? $this->redis->xReadGroup($group, $consumer, [$stream => '>'], $count, $blockMs)
+            : $this->redis->xReadGroup($group, $consumer, [$stream => '>'], $count);
+
         if (!is_array($res) || !isset($res[$stream]) || !is_array($res[$stream])) {
             return null;
         }
