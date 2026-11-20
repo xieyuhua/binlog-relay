@@ -1308,3 +1308,158 @@ php bin/binlog2redis reset-position --force
 expire_logs_days = 7          # 至少能覆盖一次周末
 max_binlog_size  = 512M
 ```
+
+---
+
+## 23. 自定义处理器与脚本
+
+两个位置都可以挂载业务逻辑：
+
+```
+relay（读 binlog）                     consumer（读队列）
+   └── handlers: [...]                    └── sink.driver = custom
+       ├── 内置（Stdout/MultiStream）          └── class: 你的类
+       ├── ScriptHandler（外部脚本）
+       └── 你的类（HandlerInterface）
+```
+
+### 23.1 方式一：自定义 Handler 类（打进二进制）
+
+```php
+final class OrderSyncHandler implements HandlerInterface
+{
+    public function handle(array $changes): void   // Change[]
+    {
+        foreach ($changes as $c) {
+            // $c->op / database / table / row / before / tableKey
+        }
+    }
+}
+```
+
+```php
+// config/relay.php
+'handlers' => [
+    BinlogRelay\Handler\StdoutHandler::class,
+    App\OrderSyncHandler::class,          // 类名即可，框架自动 new
+    // new App\OrderSyncHandler('自定义参数'),   // 需要构造参数时给实例
+],
+```
+
+### 23.2 方式二：外部脚本（ScriptHandler）
+
+脚本放磁盘、不进二进制，改完重启即可生效：
+
+```php
+// config/relay.php
+'handlers' => [
+    new BinlogRelay\Handler\ScriptHandler(
+        getenv('RELAY_SCRIPT') ?: '/opt/binlog-relay/scripts/order-sync.php'
+    ),
+],
+```
+
+**协议**（脚本必须遵守）：
+
+```
+stdin   每行一个 JSON 数组（一批变更）
+stdout  每行必须是 {"ok":true} 或 {"ok":false,"error":"..."}
+stderr  原样转发到框架日志
+```
+
+⚠️ **stdout 是协议通道**，业务输出（日志、调试信息）必须写 stderr，否则会破坏通信。
+
+脚本是**常驻进程**（读一行 → 处理 → 回一行 → 循环），所以数据库连接可以建在循环外。
+
+完整示例见 `examples/scripts/`：
+
+| 脚本 | 用途 |
+|---|---|
+| `01-stdout-echo.php` | 最小示例 |
+| `02-mysql-upsert.php` | 批量 upsert 到 MySQL |
+| `03-redis-cache-invalidate.php` | 缓存失效 |
+| `04-webhook-push.php` | HTTP 推送（带 HMAC 签名） |
+| `05-filter-and-forward.php` | 审计日志 |
+| `06-batch-aggregate.php` | 脚本内二次攒批（高吞吐） |
+
+### 23.3 打包成二进制后如何引用外部脚本
+
+二进制里代码在 `phar://` 内，**`__DIR__` 指向 phar 内部**，所以脚本路径必须用绝对路径：
+
+```php
+// ❌ 打包后失效
+new ScriptHandler(__DIR__ . '/../scripts/x.php')
+
+// ✅ 用环境变量或绝对路径
+new ScriptHandler(getenv('RELAY_SCRIPT') ?: '/opt/binlog-relay/scripts/x.php')
+```
+
+部署结构：
+
+```
+/opt/binlog-relay/
+├── relay                  ← 二进制
+├── config/relay.php       ← 外部配置
+└── scripts/*.php          ← 外部脚本
+```
+
+启动：
+
+```bash
+cd /opt/binlog-relay
+RELAY_CONFIG=./config/relay.php ./relay start
+```
+
+**脚本由 `PHP_BINARY` 启动**，打包场景下就是 phpmicro 自身，所以脚本可用的扩展
+与二进制编译进去的一致（见第 9.1 节的扩展清单）。
+
+⚠️ **平台限制**：`ScriptHandler` 用 `proc_open` 管道通信。
+Windows 的管道不支持非阻塞与超时（`stream_set_blocking` 返回 false，
+`stream_set_timeout` 对管道无效），脚本卡死时无法及时超时。
+**生产环境请用 Linux。**
+
+### 23.4 方式三：消费端自定义 Sink
+
+消费端也可以挂自己的类，两种接口二选一：
+
+```php
+// A. 复用 relay 侧逻辑（收到 Change）
+final class OrderMirror implements HandlerInterface
+{
+    public function handle(array $changes): void { /* Change[] */ }
+}
+
+// B. 需要 Redis entry id 时（收到 Message）
+final class RawDump implements MessageHandlerInterface
+{
+    public function handle(array $messages): void { /* Message[] */ }
+}
+```
+
+```php
+// config/consumer.php
+'sink' => [
+    'driver' => 'custom',
+    'custom' => [
+        'class' => App\OrderMirror::class,
+        'args'  => ['mysql:host=127.0.0.1;dbname=mirror', 'root', 'pass'],
+    ],
+],
+```
+
+完整示例见 `examples/CustomSinkExample.php`。同一个类既能当 relay 的 handler，
+也能当 consumer 的 sink。
+
+### 23.5 三种方式怎么选
+
+| | 自定义 Handler 类 | ScriptHandler 脚本 | 自定义 Sink（消费端） |
+|---|---|---|---|
+| 改完是否要重新打包 | 是 | **否** | 是 |
+| 能否用项目类 | ✅ | ❌（必须自包含） | ✅ |
+| 类型安全 | `Change` 对象 | 纯数组 | `Change` / `Message` |
+| 进程隔离 | 否（同主进程） | ✅ 独立子进程 | 否 |
+| 额外开销 | 无 | 进程间通信 | 无 |
+| 适用 | 生产主路径 | 频繁改动 / 独立演进 | 消费端定制 |
+
+**推荐**：核心链路用自定义 Handler 类（性能和类型安全最好）；
+业务规则频繁变动、且能独立部署的用 ScriptHandler。

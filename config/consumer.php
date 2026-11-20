@@ -79,6 +79,14 @@ return [
             'delete_column' => '_is_deleted',
         ],
 
+        // 自定义实现：driver=custom 时用
+        // 类需实现 BinlogRelay\Handler\HandlerInterface（收到 Change）
+        // 或 BinlogRelay\Sink\MessageHandlerInterface（收到 Message）
+        'custom' => [
+            'class' => env('CONSUMER_CUSTOM_CLASS', ''),
+            'args'  => [],   // 按顺序传给构造函数
+        ],
+
         'elasticsearch' => [
             'url'          => env('CONSUMER_ES_URL', 'http://127.0.0.1:9200'),
             'index_prefix' => env('CONSUMER_ES_PREFIX', ''),

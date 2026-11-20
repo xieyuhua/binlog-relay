@@ -16,6 +16,8 @@ $tests = [
     '点位恢复策略' => __DIR__ . '/CheckpointResumeTest.php',
     '权限解析' => __DIR__ . '/GrantParseTest.php',
     'Redis API 契约' => __DIR__ . '/RedisApiTest.php',
+    '自定义 Sink' => __DIR__ . '/CustomSinkTest.php',
+    '脚本处理器' => __DIR__ . '/ScriptHandlerTest.php',
 ];
 
 $failed = 0;

@@ -89,6 +89,39 @@ final readonly class Message
         );
     }
 
+    /**
+     * 还原成 Change，便于复用 relay 侧的处理器
+     *
+     * 注意：binlogFile/binlogPos 已拆在 pos 字段里，这里按 ':' 还原；
+     * gtid 与 server_id 在消息中没单独存，从 data 里取（旧消息可能为空）。
+     */
+    public function toChange(): \BinlogRelay\Event\Change
+    {
+        [$file, $position] = str_contains($this->pos, ':')
+            ? explode(':', $this->pos, 2)
+            : [$this->pos, '0'];
+
+        return new \BinlogRelay\Event\Change(
+            $this->op,
+            $this->database,
+            $this->table,
+            $this->row(),
+            $this->before(),
+            $this->tableKey(),
+            $file,
+            $position,
+            (string)($this->data['gtid'] ?? ''),
+            $this->timestamp,
+            (int)($this->data['server_id'] ?? 0)
+        );
+    }
+
+    /** @return list<\BinlogRelay\Event\Change> */
+    public static function toChanges(array $messages): array
+    {
+        return array_map(static fn(self $m) => $m->toChange(), $messages);
+    }
+
     public function row(): array
     {
         return is_array($this->data['row'] ?? null) ? $this->data['row'] : [];

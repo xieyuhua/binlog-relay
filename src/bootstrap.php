@@ -24,13 +24,9 @@ if (!function_exists('BinlogRelay\\bootstrap')) {
         }
         $done = true;
 
-        $autoload = BINLOG_RELAY_ROOT . '/vendor/autoload.php';
-        if (is_file($autoload)) {
-            require $autoload;
-            return;
-        }
-
-        // 内置 PSR-4：BinlogRelay\Xxx → src/Xxx.php
+        // 内置 PSR-4 始终注册（而非"有 vendor 就跳过"）：
+        // composer 的 classmap 是生成时的快照，新增/重命名的文件不在里面，
+        // composer autoloader 找不到时会落到这里兜底。重复注册无副作用。
         spl_autoload_register(static function (string $class): void {
             $prefix = 'BinlogRelay\\';
             if (!str_starts_with($class, $prefix)) {
@@ -56,7 +52,17 @@ if (!function_exists('BinlogRelay\\bootstrap')) {
             }
         });
 
-        require_once BINLOG_RELAY_ROOT . '/src/Support/env.php';
+        // 存在 composer autoload 时加载它（第三方包 + 优化后的 classmap）。
+        // 它自身可能通过 autoload.files 引入 src/Support/env.php，
+        // 所以必须用 in_array 判断而不是无条件 require。
+        $autoload = BINLOG_RELAY_ROOT . '/vendor/autoload.php';
+        if (is_file($autoload)) {
+            require_once $autoload;
+        }
+
+        if (!function_exists('env')) {
+            require_once BINLOG_RELAY_ROOT . '/src/Support/env.php';
+        }
     }
 }
 

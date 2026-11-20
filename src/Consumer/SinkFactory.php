@@ -25,6 +25,12 @@ final class SinkFactory
         $ops = $cfg['ops'] ?? [];
 
         return match ($driver) {
+            // 自定义实现：类名 + 构造参数
+            'custom' => new \BinlogRelay\Sink\CustomSink(
+                (string)($cfg['custom']['class'] ?? ''),
+                (array)($cfg['custom']['args'] ?? [])
+            ),
+
             'http' => new HttpSink(
                 (string)$cfg['http']['url'],
                 (array)($cfg['http']['headers'] ?? []),
