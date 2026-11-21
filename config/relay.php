@@ -39,6 +39,10 @@ return [
         // 注意：开启后如果 tables 和 columns 都没配表，等于丢弃所有表。
         'only_configured' => (bool) env('RELAY_ONLY_CONFIGURED', false),
 
+        // 是否同步 DDL（建表/改表等结构变更）
+        // 开启后会额外订阅 QUERY 事件，处理器需实现 DdlHandlerInterface
+        'emit_ddl' => (bool) env('RELAY_EMIT_DDL', false),
+
         // 列裁剪：只保留业务需要的列，其余在入队前丢弃
         // 收益：队列体积、网络传输、消费端解析、下游写入全面下降
         // 注意：主键列永远保留；before 行同样会被裁剪

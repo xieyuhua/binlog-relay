@@ -59,13 +59,19 @@ final class Relay
         // 无主键表只告警一次，避免每个事件都刷日志
         EventBuilder::onMissingKey(fn(string $msg) => $this->logger->warning($msg));
 
+        // DDL 需要额外订阅 QUERY 事件；getSubscribedEvents() 是静态的，
+        // 必须在构造订阅者之前设置开关
+        $emitDdl = (bool)($this->config['filter']['emit_ddl'] ?? false);
+        RowSubscriber::enableDdl($emitDdl);
+
         $this->subscriber = new RowSubscriber(
             $this->handlers,
             Filter::fromConfig($this->config['filter'] ?? []),
             $this->positions,
             $this->logger,
             (int)($this->config['batch_size'] ?? 200),
-            Connector::makeProjector($this->config, $this->logger)
+            Connector::makeProjector($this->config, $this->logger),
+            $emitDdl
         );
     }
 
@@ -84,7 +90,15 @@ final class Relay
     public function runUntil(?float $deadline): void
     {
         $mysql = $this->config['mysql'];
-        $builder = Connector::build($this->config, $this->positions->load(), $this->logger);
+        $checkpoint = $this->positions->load();
+
+        // 可选：维护完整的 GTID 执行集合（跨 binlog 文件续传时需要）
+        if (!empty($this->config['gtid_set'])) {
+            $this->positions->enableGtidSet((string)($checkpoint?->gtid ?? ''));
+            $this->logger->info('已启用 GTID 集合累积');
+        }
+
+        $builder = Connector::build($this->config, $checkpoint, $this->logger);
 
         $factory = new MySQLReplicationFactory($builder->build(), logger: $this->logger);
         $factory->registerSubscriber($this->subscriber);

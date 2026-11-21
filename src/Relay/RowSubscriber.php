@@ -6,12 +6,16 @@ namespace BinlogRelay\Relay;
 
 use BinlogRelay\Checkpoint\PositionManager;
 use BinlogRelay\Event\ColumnProjector;
+use BinlogRelay\Event\DdlChange;
 use BinlogRelay\Event\EventBuilder;
 use BinlogRelay\Event\Filter;
+use BinlogRelay\Handler\DdlHandlerInterface;
+use BinlogRelay\Handler\HandlerChain;
 use BinlogRelay\Handler\HandlerInterface;
 use BinlogRelay\Replication\Definitions\ConstEventsNames;
 use BinlogRelay\Replication\Event\DTO\DeleteRowsDTO;
 use BinlogRelay\Replication\Event\DTO\EventDTO;
+use BinlogRelay\Replication\Event\DTO\QueryDTO;
 use BinlogRelay\Replication\Event\DTO\UpdateRowsDTO;
 use BinlogRelay\Replication\Event\DTO\WriteRowsDTO;
 use BinlogRelay\Replication\Event\DTO\RowsDTO;
@@ -46,6 +50,8 @@ class RowSubscriber extends EventSubscribers
         protected readonly Logger $logger,
         protected readonly int $batchSize = 200,
         protected readonly ?ColumnProjector $projector = null,
+        /** 是否把 DDL 事件交给 handler（需要额外订阅 QUERY 事件） */
+        protected readonly bool $emitDdl = false,
     ) {
         $this->lastFlushAt = microtime(true);
     }
@@ -53,7 +59,7 @@ class RowSubscriber extends EventSubscribers
     public static function getSubscribedEvents(): array
     {
         // 注意：事件名来自 ConstEventsNames（'write'），不是 ConstEventType（'WRITE_ROWS_EVENT_V2'）
-        return [
+        $events = [
             ConstEventsNames::WRITE->value  => 'onWrite',
             ConstEventsNames::UPDATE->value => 'onUpdate',
             ConstEventsNames::DELETE->value => 'onDelete',
@@ -61,6 +67,71 @@ class RowSubscriber extends EventSubscribers
             ConstEventsNames::ROTATE->value => 'onRotate',
             ConstEventsNames::GTID->value   => 'onGTID',
         ];
+
+        // DDL 需要 QUERY 事件；订阅它是可选的，因为大多数 QUERY 是 BEGIN/COMMIT，
+        // 解析它们有成本，未开启时不订阅
+        if (self::$emitDdlStatic) {
+            $events[ConstEventsNames::QUERY->value] = 'onQuery';
+        }
+
+        return $events;
+    }
+
+    /** 静态开关：getSubscribedEvents() 是静态方法，无法读实例属性 */
+    private static bool $emitDdlStatic = false;
+
+    /** 在注册订阅者之前调用，决定是否订阅 QUERY 事件 */
+    public static function enableDdl(bool $enabled = true): void
+    {
+        self::$emitDdlStatic = $enabled;
+    }
+
+    /**
+     * QUERY 事件：挑出 DDL 交给 handler
+     *
+     * 非 DDL 语句（BEGIN/COMMIT/INSERT 等）直接忽略。
+     */
+    public function onQuery(QueryDTO $event): void
+    {
+        if (!$this->emitDdl) {
+            return;
+        }
+
+        $op = DdlChange::classify($event->query);
+        if ($op === null) {
+            return;   // 不是 DDL
+        }
+
+        $info = $event->getEventInfo();
+        $current = $info->binLogCurrent;
+
+        $ddl = new DdlChange(
+            $op,
+            (string)$event->database,
+            DdlChange::extractTables($event->query),
+            $event->query,
+            $this->safeStr($current, 'getBinFileName'),
+            $this->safeStr($current, 'getBinLogPosition', '0'),
+            (int)$info->timestamp,
+            (int)$info->serverId
+        );
+
+        // DDL 单独分发：只有实现 DdlHandlerInterface 的处理器会收到
+        if ($this->handler instanceof HandlerChain) {
+            $this->handler->handleDdl($ddl);
+        } elseif ($this->handler instanceof DdlHandlerInterface) {
+            $this->handler->handleDdl($ddl);
+        }
+        $this->positions->track($current);
+    }
+
+    private function safeStr(object $obj, string $method, string $default = ''): string
+    {
+        try {
+            return (string)$obj->{$method}();
+        } catch (\Throwable) {
+            return $default;
+        }
     }
 
     public function onWrite(WriteRowsDTO $event): void

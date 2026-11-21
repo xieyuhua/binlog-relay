@@ -20,6 +20,10 @@ $tests = [
     '脚本处理器' => __DIR__ . '/ScriptHandlerTest.php',
     '二进制读取器' => __DIR__ . '/BinaryReaderTest.php',
     '列类型解码' => __DIR__ . '/ColumnTypeTest.php',
+    'GTID 集合' => __DIR__ . '/GtidSetTest.php',
+    'DDL 识别' => __DIR__ . '/DdlChangeTest.php',
+    '全量同步分页' => __DIR__ . '/FullSyncTest.php',
+
 ];
 
 $failed = 0;

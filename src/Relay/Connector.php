@@ -36,17 +36,7 @@ final class Connector
             ->withHeartbeatPeriod((float)($mysql['heartbeat'] ?? 30))
             ->withTableCacheSize((int)($mysql['table_cache_size'] ?? 256))
             // 只订阅行变更与事务边界；DDL 等事件不进入业务管道
-            ->withEventsOnly([
-                ConstEventType::WRITE_ROWS_EVENT_V1->value,
-                ConstEventType::WRITE_ROWS_EVENT_V2->value,
-                ConstEventType::UPDATE_ROWS_EVENT_V1->value,
-                ConstEventType::UPDATE_ROWS_EVENT_V2->value,
-                ConstEventType::DELETE_ROWS_EVENT_V1->value,
-                ConstEventType::DELETE_ROWS_EVENT_V2->value,
-                ConstEventType::XID_EVENT->value,
-                ConstEventType::ROTATE_EVENT->value,
-                ConstEventType::GTID_LOG_EVENT->value,
-            ]);
+            ->withEventsOnly(self::eventWhitelist($filter));
 
         // 库过滤
         if (($filter['databases'] ?? []) !== []) {
@@ -80,6 +70,35 @@ final class Connector
         }
 
         return $builder;
+    }
+
+    /**
+     * 事件白名单
+     *
+     * 默认只订阅行变更与事务边界；开启 DDL 同步时额外订阅 QUERY 事件。
+     * QUERY 事件在业务库里大多是 BEGIN/COMMIT，解析有成本，所以做成可选。
+     *
+     * @return list<int>
+     */
+    private static function eventWhitelist(array $filter): array
+    {
+        $events = [
+            ConstEventType::WRITE_ROWS_EVENT_V1->value,
+            ConstEventType::WRITE_ROWS_EVENT_V2->value,
+            ConstEventType::UPDATE_ROWS_EVENT_V1->value,
+            ConstEventType::UPDATE_ROWS_EVENT_V2->value,
+            ConstEventType::DELETE_ROWS_EVENT_V1->value,
+            ConstEventType::DELETE_ROWS_EVENT_V2->value,
+            ConstEventType::XID_EVENT->value,
+            ConstEventType::ROTATE_EVENT->value,
+            ConstEventType::GTID_LOG_EVENT->value,
+        ];
+
+        if (!empty($filter['emit_ddl'])) {
+            $events[] = ConstEventType::QUERY_EVENT->value;
+        }
+
+        return $events;
     }
 
     /** 按配置构造列裁剪器；未配置时返回 null（零开销路径） */

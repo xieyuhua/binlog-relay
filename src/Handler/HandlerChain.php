@@ -57,4 +57,30 @@ final class HandlerChain implements HandlerInterface
             }
         }
     }
+
+    /**
+     * 分发 DDL 事件：只调用实现了 DdlHandlerInterface 的处理器
+     *
+     * 没实现该接口的处理器会被跳过——这是刻意的，
+     * 避免强迫所有 handler 关心低频的 DDL。
+     */
+    public function handleDdl(\BinlogRelay\Event\DdlChange $ddl): void
+    {
+        foreach ($this->handlers as $handler) {
+            if (!$handler instanceof DdlHandlerInterface) {
+                continue;
+            }
+            $start = microtime(true);
+            $handler->handleDdl($ddl);
+            $cost = (microtime(true) - $start) * 1000;
+            if ($cost > 500) {
+                $this->logger->warning(sprintf(
+                    '%s 处理 DDL 耗时 %.0fms（%s）',
+                    $handler::class,
+                    $cost,
+                    $ddl->op
+                ));
+            }
+        }
+    }
 }

@@ -58,6 +58,8 @@ try {
         case 'reset-position':
             reset_position($config, $options);
             break;
+        case 'fullsync':
+            exit(run_fullsync($config, $options));
         case 'check':
             exit(run_check($config));
         case 'help':
@@ -120,6 +122,121 @@ function show_status(array $config): void
 function reset_position(array $config, array $options): void
 {
     exit(BinlogRelay\Console\CheckpointCommand::reset(make_store($config), isset($options['force'])));
+}
+
+/**
+ * 全量同步：把现存数据以快照形式推一遍，并记录起始位点
+ *
+ * 用法：
+ *   binlog2redis fullsync                 同步配置里 filter 指定的库表
+ *   binlog2redis fullsync --tables=orders 只同步指定表
+ *   binlog2redis fullsync --dry-run       只列出表和行数，不推送
+ *
+ * 完成后直接启动 `binlog2redis start` 即可接续增量（点位已对齐）。
+ */
+function run_fullsync(array $config, array $options): int
+{
+    $logger = make_logger($config);
+    $mysql = $config['mysql'];
+
+    // ---- 1. 先记录位点（必须在快照之前，否则会丢快照期间的变更）----
+    $store = make_store($config);
+    $positions = make_positions($store, $logger, $config);
+
+    $pdo = new PDO(
+        sprintf('mysql:host=%s;port=%d;charset=%s', $mysql['host'], $mysql['port'], $mysql['charset'] ?? 'utf8mb4'),
+        (string)$mysql['user'],
+        (string)$mysql['password'],
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 10]
+    );
+
+    $status = $pdo->query('SHOW MASTER STATUS')->fetch(PDO::FETCH_ASSOC);
+    if ($status === false) {
+        // MySQL 8.4 起改名
+        $status = $pdo->query('SHOW BINARY LOG STATUS')->fetch(PDO::FETCH_ASSOC);
+    }
+    if ($status === false || !isset($status['File'])) {
+        fwrite(STDERR, "无法读取 binlog 位点，请确认 log_bin 已开启且有 REPLICATION CLIENT 权限\n");
+        return 1;
+    }
+    $startFile = (string)$status['File'];
+    $startPos = (string)$status['Position'];
+
+    $dryRun = isset($options['dry-run']);
+    if (!$dryRun) {
+        if (!$store->acquireLock('fullsync:' . getmypid(), 600)) {
+            fwrite(STDERR, "点位被占用（relay 可能在运行）。全量同步请先停止 relay\n");
+            return 2;
+        }
+        $store->save(new \BinlogRelay\Checkpoint\Checkpoint($startFile, $startPos, '', time(), 0, 'fullsync'));
+        $store->releaseLock('fullsync:' . getmypid());
+        $logger->info("起始位点已记录：{$startFile}:{$startPos}");
+    }
+
+    // ---- 2. 列出待同步的表 ----
+    $filter = $config['filter'] ?? [];
+    $onlyTables = array_filter(array_map('trim', explode(',', (string)($options['tables'] ?? ''))));
+    $syncer = new \BinlogRelay\FullSync\FullSyncer(
+        $pdo,
+        $logger,
+        (int)($config['fullsync']['batch_size'] ?? 1000)
+    );
+
+    $tables = $syncer->listTables(
+        $filter['databases'] ?? [],
+        $onlyTables !== [] ? $onlyTables : ($filter['tables'] ?? [])
+    );
+
+    if ($tables === []) {
+        fwrite(STDERR, "没有匹配到需要同步的表，请检查 filter.databases / filter.tables\n");
+        return 1;
+    }
+
+    $logger->info(sprintf('待同步 %d 张表', count($tables)));
+    if ($dryRun) {
+        foreach ($tables as $t) {
+            echo "  {$t['database']}.{$t['table']}\n";
+        }
+        echo "\n（--dry-run，未推送任何数据）\n";
+        return 0;
+    }
+
+    // ---- 3. 逐表推送快照 ----
+    $writer = new \BinlogRelay\Standalone\StreamWriter($config, $logger);
+    $writer->boot();
+
+    $grandTotal = 0;
+    $startedAt = microtime(true);
+
+    foreach ($tables as $i => $t) {
+        $db = $t['database'];
+        $tb = $t['table'];
+        $n = $syncer->syncTable($db, $tb, function (array $changes) use ($writer): void {
+            // 快照消息与增量格式完全一致，下游无需区分
+            $writer->handle($changes);
+        });
+        $grandTotal += $n;
+        $logger->info(sprintf(
+            '[%d/%d] %s.%s 完成，%d 行',
+            $i + 1,
+            count($tables),
+            $db,
+            $tb,
+            $n
+        ));
+    }
+
+    $cost = microtime(true) - $startedAt;
+    $logger->info(sprintf(
+        '全量同步完成：%d 张表 / %d 行 / %.1f 秒（%.0f 行/秒）',
+        count($tables),
+        $grandTotal,
+        $cost,
+        $grandTotal / max($cost, 0.001)
+    ));
+    echo "\n下一步：binlog2redis start（会从 {$startFile}:{$startPos} 开始回放增量）\n";
+
+    return 0;
 }
 
 function run_check(array $config): int
@@ -229,6 +346,9 @@ binlog2redis · binlog → Redis Stream 单文件服务
 用法：
   binlog2redis start                    启动（Ctrl+C / SIGTERM 优雅退出）
   binlog2redis once --seconds=5         消费指定秒数后退出
+  binlog2redis fullsync                 全量同步（快照现存数据，并记录起始位点）
+  binlog2redis fullsync --dry-run       只列出待同步的表
+  binlog2redis fullsync --tables=a,b    只同步指定表
   binlog2redis status                   查看点位
   binlog2redis reset-position --force   重置点位
   binlog2redis check                    MySQL / Redis / 点位 自检

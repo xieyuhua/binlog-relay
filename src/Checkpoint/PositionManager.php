@@ -76,6 +76,33 @@ final class PositionManager
         return $cp;
     }
 
+    /**
+     * 是否累积 GTID 执行集合
+     *
+     * 关闭时只记录最后事务的 GTID（旧行为，开销几乎为零）；
+     * 开启后维护完整集合，可用于跨 binlog 文件续传。
+     */
+    private bool $trackGtidSet = false;
+
+    /** 累积中的 GTID 集合（仅在 trackGtidSet 为 true 时维护） */
+    private ?GtidSet $gtidSet = null;
+
+    /** 上一个已合并的 GTID，避免同一事务被重复合并（XID/ROTATE 会多次 track） */
+    private string $lastGtid = '';
+
+    /** 开启 GTID 集合累积，并用历史点位初始化 */
+    public function enableGtidSet(string $initial = ''): void
+    {
+        $this->trackGtidSet = true;
+        $this->gtidSet = $initial === '' ? new GtidSet() : GtidSet::parse($initial);
+    }
+
+    /** 当前累积的 GTID 集合（未开启时返回 null） */
+    public function gtidSet(): ?GtidSet
+    {
+        return $this->gtidSet;
+    }
+
     /** 记录当前 binlog 位置（每个事件调用一次，纯内存操作） */
     public function track(BinLogCurrent $current): void
     {
@@ -84,11 +111,22 @@ final class PositionManager
         $pos = $this->safeGet($current, 'getBinLogPosition', '0');
         $gtid = $this->safeGet($current, 'getGtid');
 
+        // 开启集合模式时，把当前事务并入集合；用 lastGtid 去重，
+        // 因为同一事务的 ROWS/XID/ROTATE 事件会多次调用 track()
+        if ($this->trackGtidSet && $gtid !== '' && $gtid !== $this->lastGtid) {
+            try {
+                $this->gtidSet?->addGtid($gtid);
+                $this->lastGtid = $gtid;
+            } catch (\InvalidArgumentException) {
+                // 单事务 GTID 格式异常时跳过，不中断主流程
+            }
+        }
+
         $this->totalEvents++;
         $this->pending = new Checkpoint(
             $file,
             $pos,
-            $gtid,
+            $this->trackGtidSet ? (string)$this->gtidSet : $gtid,
             time(),
             $this->baseEvents + $this->totalEvents,
             $this->owner

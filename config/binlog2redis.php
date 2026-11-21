@@ -34,6 +34,10 @@ return [
         // 1 = 只处理下面 tables / columns 里配置过的表，其余整表丢弃
         'only_configured' => (bool) env('RELAY_ONLY_CONFIGURED', false),
 
+        // 是否同步 DDL（建表/改表等结构变更）
+        // 开启后会额外订阅 QUERY 事件，处理器需实现 DdlHandlerInterface
+        'emit_ddl' => (bool) env('RELAY_EMIT_DDL', false),
+
         // 列裁剪：只保留业务需要的列
         'columns' => [
             // 'orders' => ['id', 'status', 'amount', 'updated_at'],
@@ -87,6 +91,16 @@ return [
         'every_events' => (int) env('RELAY_CHECKPOINT_EVERY', 100),
         // 或每 N 秒（先到先触发）
         'every_seconds' => (float) env('RELAY_CHECKPOINT_SECONDS', 1.0),
+    ],
+
+    // 是否累积完整的 GTID 执行集合（跨 binlog 文件续传时需要）
+    // 关闭时点位里只记最后事务的 GTID，仅作参考
+    'gtid_set' => (bool) env('RELAY_GTID_SET', false),
+
+    // 全量同步参数
+    'fullsync' => [
+        // 每批从源库读取的行数
+        'batch_size' => (int) env('RELAY_FULLSYNC_BATCH', 1000),
     ],
 
     // 每批交给写入器的变更行数

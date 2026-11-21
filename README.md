@@ -1579,20 +1579,93 @@ final class RawDump implements MessageHandlerInterface
 
 吞吐低于 Maxwell 是事实：PHP 单线程 vs JVM JIT。
 
-### 24.2 Canal
+### 24.2 Canal（阿里巴巴出品）
+
+Canal 最早是为「MySQL 增量订阅 + 同步到下游」设计的中间件，生态成熟、国内用得最广。
 
 | 维度 | 本项目 | Canal |
 |---|---|---|
-| 定位 | 轻量中继 + 消费端 | 阿里出品，生态完整 |
-| 协议 | MySQL 复制协议直连 | 同 |
-| 部署 | 单文件二进制 | Java + ZooKeeper（HA 模式） |
-| 客户端 | 内置 5 种 sink | 需自备客户端 |
-| 运维复杂度 | 低 | 高 |
+| 定位 | 轻量中继 + 内置消费端 | CDC 服务端，需搭配客户端 |
+| 实现语言 | PHP（纯 PHP 解析 binlog 协议） | Java（Netty + 自定义协议解析） |
+| **架构** | 单进程：解析 → 过滤 → 直接写目标 | **Client/Server 分离**：Server 解析 → 自定义协议 → Client 拉取 |
+| 协议解析 | 直连 MySQL 复制协议 | 同 |
+| 支持的 MySQL | 5.5–8.0、MariaDB | 5.1–8.0、MariaDB、部分分支 |
+| 过滤能力 | 库/表/列，`only_configured` | 库/表过滤、正则；**无列裁剪** |
+| 点位 | file+pos（+ 单事务 GTID 参考） | file+pos + **完整 GTID 集合** |
+| **HA** | ❌ 单实例 + 锁互斥 | ✅ ZooKeeper 选主 |
+| **全量初始化** | ❌ | ✅ `canal.adapter` 支持 |
+| **DDL 同步** | ❌ | ✅ 可配置过滤/同步 |
+| 输出 | 内置 5 种 sink + 自定义 | 自有协议 / Kafka / RocketMQ / RabbitMQ |
+| 消费端 | ✅ 内置，一条命令跑起来 | 需另写 client（Java）或接 MQ 再消费 |
+| 监控 | `status` 命令 | ✅ Prometheus metrics、admin 控制台 |
+| 部署依赖 | 无（单文件） | JDK +（HA 时）ZooKeeper + 配置管理 |
+| 部署体积 | 19.5 MB | 100 MB+（含依赖） |
+| 运维复杂度 | 低 | 中高 |
+
+**性能对比**
+
+Canal 官方与社区的公开数据是**单实例 10k–30k events/s**（Java + Netty，
+事件级流水线），本项目实测 **7k–8k events/s**。
+
+差距主要来自：
+
+| 因素 | 影响 |
+|---|---|
+| JVM JIT vs PHP 解释执行 | 热路径代码 JIT 后快 2–5 倍 |
+| Netty 零拷贝 vs PHP 字符串操作 | 网络层与缓冲区管理 |
+| Canal 只解析不落地，客户端拉取 | 本项目解析后还要序列化 + 写 Redis |
+
+**但要注意**：Canal 的 10k–30k 是 **Server 端解析吞吐**，实际端到端还要加上
+「Client 拉取 + 业务处理」。而且 Canal 的吞吐优势要在**大批量、窄表**场景才明显；
+如果行里有 TEXT/BLOB，瓶颈会转移到网络传输和下游写入，两者差距会缩小。
+
+**什么时候 Canal 更合适**
+
+| 场景 | 原因 |
+|---|---|
+| 需要 **HA / 高可用** | ZooKeeper 选主，主备切换 |
+| 需要**全量初始化** | canal.adapter 内置 |
+| 需要**同步 DDL** | 内置支持 |
+| 已有 Kafka/RocketMQ 生态 | Canal 原生对接 |
+| 吞吐 > 10k events/s | Java 性能优势 |
+| 团队是 Java 栈 | 运维与排障一致 |
+| 多业务方订阅同一份 binlog | Client/Server 分离更合适 |
+
+**什么时候本项目更合适**
+
+| 场景 | 原因 |
+|---|---|
+| 单点同步，不需要 HA | 部署就一个文件 |
+| 目标就是 Redis/MySQL/HTTP | 内置 sink，不需要再搭 MQ 和 consumer |
+| 需要**列裁剪丢大字段** | Canal 只能整行输出 |
+| 需要**单进程多 topic 扇出** | Canal 靠 MQ 做分发 |
+| 部署环境受限 | 无 JDK |
+| PHP 团队 | 零语言切换成本 |
+
+**一个容易被忽略的差异**：Canal 是 **pull 模型**（Server 等 Client 来拉），
+本项目是 **push 模型**（解析后直接写目标）。
+pull 更适合「多消费者、消费速度不一致」，push 更适合「单目标、链路短」。
+如果你的场景是「一份 binlog 要喂给 5 个不同业务」，Canal 的架构更自然；
+如果只是「同步到 Redis」，本项目的 push 少了两跳网络。
 
 ### 24.3 Debezium
 
 Debezium 是 CDC 平台级方案：全量+增量、schema 演进、CDC 到 Kafka Connect 生态。
 本项目与之不在同一量级——Debezium 适合做企业级数据集成，本项目适合单点轻量同步。
+
+**能力对比**（Debezium 明显更强）：
+
+| 维度 | 本项目 | Debezium |
+|---|---|---|
+| 全量 + 增量 | ❌ 仅增量 | ✅ snapshot + streaming |
+| Schema 演进 | ❌ | ✅ 内置 |
+| 支持的数据库 | MySQL 系 | MySQL、PG、Oracle、SQL Server、MongoDB… |
+| 生态 | 无 | Kafka Connect 插件生态 |
+| 部署 | 19.5 MB 单文件 | Kafka + Connect 集群 |
+
+**但 Debezium 的隐性成本**：必须部署 Kafka（或 Kafka Connect 集群），
+运维成本是 Canal 的数倍。除非你已经在用 Kafka，否则为一个 MySQL 同步需求
+引入整套 Kafka 生态通常不划算。
 
 ### 24.4 什么时候该选本项目
 
@@ -1672,3 +1745,151 @@ php tests/bench.php          # EventBuilder / 序列化 / 点位
 php tests/netbench.php       # 网络 IO（sockets vs stream_socket）
 php tests/run-all.php        # 含 BinaryReaderTest / ColumnTypeTest
 ```
+
+---
+
+## 26. GTID 集合、DDL 同步与全量同步
+
+补齐了此前对比 Maxwell 时列出的三个缺口。
+
+### 26.1 GTID 执行集合
+
+**问题**：旧实现只记录「最后处理的那个事务」`uuid:2901`，
+而 `COM_BINLOG_DUMP_GTID` 需要**完整执行集合** `uuid:1-2901`。
+拿单事务当集合发给主库，会报 `master has purged binary logs`。
+
+**实现**：`src/Checkpoint/GtidSet.php`，按 SID 分组合并闭区间。
+
+```php
+$set = new GtidSet();
+$set->addGtid('uuid:1');
+$set->addGtid('uuid:2');
+$set->addGtid('uuid:5');
+echo $set;   // uuid:1-2:5   ← 自动合并
+```
+
+启用：
+
+```bash
+RELAY_GTID_SET=1 php bin/binlog2redis start
+```
+
+开启后点位里存的是完整集合（如 `uuid:1-1000:1002`），
+可跨 binlog 文件续传；关闭时仍存单事务 GTID（仅作参考）。
+
+> 注意：仍以 **file+pos 优先**恢复。GTID 集合只在没有 binlog 文件名时兜底，
+> 因为 file+pos 更精确，且不依赖主库是否保留了对应对应日志。
+
+### 26.2 DDL 同步
+
+**问题**：只订阅行事件时，下游不知道源库改了表结构。
+
+**实现**：
+- `src/Event/DdlChange.php` — DDL 事件对象 + SQL 类型识别 + 表名提取
+- `src/Handler/DdlHandlerInterface.php` — 可选接口，实现它就能收到 DDL
+- `RowSubscriber::onQuery()` — 从 QUERY 事件里挑出 DDL
+
+识别范围：`CREATE/ALTER/DROP/RENAME/TRUNCATE TABLE`、索引、库、
+以及视图/存储过程/触发器（归入 `other`）。`BEGIN`/`COMMIT`/DML 会被忽略。
+
+启用：
+
+```php
+// config/relay.php
+'filter' => ['emit_ddl' => true],
+```
+
+```php
+final class MySchemaSync implements HandlerInterface, DdlHandlerInterface
+{
+    public function handle(array $changes): void { /* 行变更 */ }
+
+    public function handleDdl(DdlChange $ddl): void
+    {
+        // $ddl->op       create_table / alter_table / ...
+        // $ddl->database 库名
+        // $ddl->tables   涉及的表
+        // $ddl->query    完整 SQL
+        echo "{$ddl->op} on {$ddl->database}.{$ddl->tables[0]}\n";
+    }
+}
+```
+
+或环境变量 `RELAY_EMIT_DDL=1`。
+
+**为什么不放进 HandlerInterface**：DDL 是低频事件，加到主接口会强迫
+所有处理器写一个空方法。用独立接口可选择性实现，且不破坏已有代码。
+
+**性能**：开启后额外订阅 `QUERY_EVENT`。业务库的 QUERY 事件大多是
+`BEGIN`/`COMMIT`，会被快速过滤，实测额外开销可忽略。
+
+### 26.3 全量同步
+
+**问题**：增量只能捕获「订阅之后」的变更，历史数据补不齐。
+
+**实现**：`binlog2redis fullsync`
+
+```bash
+# 先看会同步哪些表
+php bin/binlog2redis fullsync --dry-run
+
+# 执行（建议先停掉 relay）
+php bin/binlog2redis fullsync
+
+# 只同步指定表
+php bin/binlog2redis fullsync --tables=orders,order_items
+```
+
+**关键设计：先记位点，后快照**
+
+```
+1. 读取当前 binlog 位点 P，立刻持久化
+2. 从 P 开始逐表分批 SELECT（游标分页，不是 OFFSET）
+3. 完成后启动 relay，从 P 开始回放
+```
+
+这样：
+- **不丢**：P 之后的所有变更都会被 relay 回放
+- **可能重复**：快照期间变更过的行会被写两次
+
+重复由下游幂等吸收（`ON DUPLICATE KEY UPDATE` / ES `_id` / CK 主键去重）。
+这是全量+增量的标准做法，Maxwell / Canal 也是同样思路。
+
+**不要反过来做**（先快照后记位点）——那会丢掉快照期间发生的变更。
+
+**分页实现**：
+
+| 表类型 | 方式 |
+|---|---|
+| 单主键 | `WHERE id > ? ORDER BY id LIMIT N` |
+| 复合主键 | `WHERE (a>?) OR (a=? AND b>?) ORDER BY a,b LIMIT N` |
+| 无主键 | 单次全读 + 告警（无法保证快照一致性） |
+
+用游标而非 `OFFSET`：大表上 `OFFSET 1000000` 会全表扫描，游标分页是 O(1) 定位。
+
+**完整流程**：
+
+```bash
+# 1. 全量（会记录位点）
+php bin/binlog2redis fullsync
+
+# 2. 启动增量（自动从记录的位点接续）
+php bin/binlog2redis start
+```
+
+### 26.4 与 Maxwell 的能力对比（更新后）
+
+| 能力 | 更新前 | 现在 |
+|---|---|---|
+| file+pos 续传 | ✅ | ✅ |
+| GTID 执行集合 | ❌ | ✅ `RELAY_GTID_SET=1` |
+| DDL 同步 | ❌ | ✅ `RELAY_EMIT_DDL=1` |
+| 全量初始化 | ❌ | ✅ `fullsync` |
+| 列裁剪 | ✅ | ✅ |
+| 多 topic 扇出 | ✅ | ✅ |
+| 内置消费端 | ✅ | ✅ |
+| HA / 多实例 | ❌ | ❌ 仍是单点 |
+| 监控指标 | ❌ | ❌ 仍只有 `status` |
+
+剩下两个缺口（HA、监控）属于运维层面，需要 ZooKeeper/etcd 选主体系，
+不在本次范围内。当前单实例 + Redis 锁互斥已能满足大多数场景。
