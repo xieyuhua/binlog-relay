@@ -1994,3 +1994,154 @@ if (($msg->labels['env'] ?? '') === 'prod') {
 **实现细节**：一条变更可能命中多条规则，而每个规则的 labels 不同，
 所以 Go 版在分发时按目标**复制** Envelope（`Clone`），避免互相覆盖；
 未配置 labels 的规则不复制，走零开销路径。
+
+---
+
+## 28. 消费端示例
+
+三种 MQ 各提供一个可直接运行的示例。
+
+### 28.1 Redis Stream（PHP）
+
+`examples/consumer/redis-stream.php`
+
+```bash
+STREAM=binlog:events GROUP=cg:worker php examples/consumer/redis-stream.php
+```
+
+核心逻辑：
+
+```php
+// 1. 创建 consumer group（mkstream=true 让流不存在时自动建）
+$redis->xGroup('CREATE', $stream, $group, '0', true);
+
+// 2. 拉取未投递的消息（phpredis 只有 5 个参数）
+$res = $redis->xReadGroup($group, $consumer, [$stream => '>'], $batch, 5000);
+
+// 3. 处理成功才 ACK
+process($id, $fields);
+$redis->xAck($stream, $group, [$id]);
+```
+
+要点：
+
+| 项 | 说明 |
+|---|---|
+| `'>'` | 只取未投递的新消息；不写 `'>'` 则读自己的 pending |
+| **ACK 时机** | 处理成功后才 ACK，崩溃只会重放不会丢 |
+| **接管遗留** | 启动/空闲时 `XAUTOCLAIM` 收回超时未确认的消息 |
+| **字段类型** | Redis 里所有字段都是字符串，`row` 需 `json_decode` 一次 |
+| **幂等** | 用 `fields['id']` 作为去重键 |
+
+### 28.2 Kafka（Go）
+
+`v2-go/examples/consumer/kafka/main.go`
+
+```bash
+cd v2-go
+KAFKA_BROKERS=127.0.0.1:9092 KAFKA_TOPIC=binlog-events \
+  go run ./examples/consumer/kafka
+```
+
+核心逻辑：
+
+```go
+reader := kafka.NewReader(kafka.ReaderConfig{
+    Brokers:  []string{brokers},
+    GroupID:  group,
+    Topic:    topic,
+    MaxWait:  time.Second,
+})
+
+for {
+    msg, _ := reader.FetchMessage(ctx)
+    if err := process(msg); err == nil {
+        reader.CommitMessages(ctx, msg)   // 成功才提交 offset
+    }
+}
+```
+
+要点：
+
+| 项 | 说明 |
+|---|---|
+| **顺序性** | 生产者用 key（幂等键）哈希分区，同一行事件落同一分区、区内有序 |
+| **提交时机** | `FetchMessage` + 手动 `CommitMessages`，不是自动提交 |
+| **重放** | 提交前的崩溃会重放，下游按 `id` 幂等 |
+| **分区数** | 增加分区能提升并行度，但同一 key 的分区不会变 |
+
+### 28.3 RabbitMQ（Go）
+
+`v2-go/examples/consumer/rabbitmq/main.go`
+
+```bash
+cd v2-go
+RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/ \
+  go run ./examples/consumer/rabbitmq
+```
+
+核心逻辑：
+
+```go
+ch.Qos(100, 0, false)                  // 限制未确认消息数
+
+msgs, _ := ch.Consume(q.Name, "", false, false, false, false, nil)
+//                              ↑ autoAck=false
+
+for msg := range msgs {
+    if err := process(msg); err != nil {
+        msg.Nack(false, true)          // 重新入队
+        continue
+    }
+    msg.Ack(false)                     // 成功才确认
+}
+```
+
+要点：
+
+| 项 | 说明 |
+|---|---|
+| **交换机类型** | 生产者用 `topic` 交换机，支持 routing key 通配 |
+| **持久化** | 生产者发 `Persistent` 消息 + durable 队列，broker 重启不丢 |
+| **确认** | 生产者开 publisher confirm；消费者手动 `Ack` |
+| **Prefetch** | `Qos(100)` 控制未确认数，避免一个消费者吃满 |
+| **Header** | 生产者附带 `db`/`table`/`op`/`pos`，可按 header 过滤 |
+
+### 28.4 三个示例的共同约定
+
+**至少一次投递**：三者的 ACK/Commit 都在处理成功之后，所以崩溃会重放。
+**下游必须幂等**：
+
+```php
+// PHP
+$stmt = $pdo->prepare('INSERT INTO mirror_orders (...) VALUES (...)
+                       ON DUPLICATE KEY UPDATE ...');
+```
+
+```go
+// Go
+_, err := tx.Exec("INSERT INTO mirror_orders (...) VALUES (...) ON DUPLICATE KEY UPDATE ...")
+```
+
+或用消息里的幂等键做去重表：
+
+```sql
+INSERT INTO consumed_ids (id) VALUES (?)   -- 主键冲突即已处理
+```
+
+### 28.5 消息字段速查
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | 幂等键 `库.表:主键值` |
+| `kind` | string | `row` / `ddl` |
+| `op` | string | `insert`/`update`/`delete`/`create_table`... |
+| `db` / `table` | string | 库表 |
+| `pos` | string | `mysql-bin.NNNNNN:position` |
+| `ts` | int | 源库事件时间戳（秒） |
+| `emitted_at` | int | 中继落地时间戳 |
+| `row` | object | 变更后的行（delete 时为被删行） |
+| `before` | object? | 仅 update 有 |
+| `table_key` | array | 主键/唯一键列名 |
+| `labels` | object? | topic 级静态标签 |
+| `ddl_tables` / `ddl_query` | array/string | 仅 DDL 事件 |
