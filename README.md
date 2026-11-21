@@ -1545,3 +1545,130 @@ final class RawDump implements MessageHandlerInterface
 
 **推荐**：核心链路用自定义 Handler 类（性能和类型安全最好）；
 业务规则频繁变动、且能独立部署的用 ScriptHandler。
+
+---
+
+## 24. 与其他方案的对比
+
+### 24.1 Maxwell（最接近的对手）
+
+| 维度 | 本项目 | Maxwell |
+|---|---|---|
+| binlog 解析 | ROW 格式，全列类型 | 同 |
+| 精确定点续传 | ✅ file+pos | ✅ file+pos + GTID 集合 |
+| **完整 GTID 支持** | ⚠️ 只记录单事务 GTID，不用于续传 | ✅ 执行集合 |
+| **全量初始化** | ❌ 无 | ✅ 支持 |
+| **DDL 同步** | ❌ 不订阅 Query 事件 | ✅ 可配置 |
+| 输出目标 | Redis Stream、HTTP、TCP、MySQL、CK、ES | Kafka、Kinesis、RabbitMQ、Redis、SQS、PubSub、文件 |
+| 按表过滤 | ✅ 含 `only_configured` | ✅ |
+| **列裁剪** | ✅ | ❌ |
+| **多 topic 扇出** | ✅ 单进程 pipeline | ❌（需 Kafka 后端） |
+| **内置消费端** | ✅ 5 种 sink + 自定义 | ❌ |
+| HA / 多实例 | ❌ 单实例 + 锁互斥 | ✅ 配合 Kafka 分区 |
+| 监控指标 | ❌ 仅 `status` 命令 | ✅ JMX |
+| 部署体积 | **19.5 MB 单文件** | JDK + jar，200 MB+ |
+| 冷启动 | 毫秒级 | 3–10 秒 |
+| 内存 | ~30 MB | 200–500 MB |
+
+**性能**（本项目实测；Maxwell 为社区公开数据，未亲测）：
+
+| | 本项目 | Maxwell |
+|---|---|---|
+| 吞吐 | 7k–8k events/s | 10k–30k events/s |
+| 依赖 | 零（无 composer 包） | Kafka、Guava 等 |
+
+吞吐低于 Maxwell 是事实：PHP 单线程 vs JVM JIT。
+
+### 24.2 Canal
+
+| 维度 | 本项目 | Canal |
+|---|---|---|
+| 定位 | 轻量中继 + 消费端 | 阿里出品，生态完整 |
+| 协议 | MySQL 复制协议直连 | 同 |
+| 部署 | 单文件二进制 | Java + ZooKeeper（HA 模式） |
+| 客户端 | 内置 5 种 sink | 需自备客户端 |
+| 运维复杂度 | 低 | 高 |
+
+### 24.3 Debezium
+
+Debezium 是 CDC 平台级方案：全量+增量、schema 演进、CDC 到 Kafka Connect 生态。
+本项目与之不在同一量级——Debezium 适合做企业级数据集成，本项目适合单点轻量同步。
+
+### 24.4 什么时候该选本项目
+
+| 场景 | 原因 |
+|---|---|
+| 目标就是 Redis / MySQL / 简单 HTTP | 内置 sink 直接覆盖 |
+| 部署环境受限（无 JDK、镜像要小） | 19.5 MB 单文件 |
+| 需要列裁剪、丢大字段 | Maxwell/Canal 都不支持 |
+| PHP 团队，想用熟悉语言写 sink | 零成本 |
+| 吞吐 < 5k events/s | 完全够用 |
+| 需要内置消费端 | 其他方案都要自己写 |
+
+### 24.5 什么时候该选 Maxwell
+
+| 场景 | 原因 |
+|---|---|
+| 需要**全量初始化** | 本项目无此能力 |
+| 需要**跨 binlog 文件 / 主从切换续传** | 需完整 GTID 集合 |
+| 需要**同步 DDL** | 本项目不订阅 Query 事件 |
+| 吞吐 > 10k events/s | PHP 单线程到顶 |
+| 需要多实例 HA | 本项目是单点 |
+| 团队是 Java 栈 | 运维工具链一致 |
+
+### 24.6 已知待补缺口
+
+若要用于正式生产，建议优先补两项：
+
+1. **全量初始化**：当前只能 mysqldump + 手工对齐位点
+2. **GTID 累积集合**：主从切换时会踩坑（`master has purged binary logs` 的根因）
+
+---
+
+## 25. 解析速度还有提升空间吗
+
+### 25.1 已做的优化
+
+| 优化 | 效果 |
+|---|---|
+| `BinaryDataReader::read()` 去掉每次 `substr` 整个缓冲区（O(n²)→O(n)） | -7.5% |
+| 列类型判断 `elseif` 链 → `switch` | 该语句快 ~30% |
+| `EventBuilder` 主键列缓存 + 归一化类型分派 | -32%（前次） |
+| 列裁剪提前到对象构造前 | -48%（前次） |
+| `Filter` 加表级结果缓存 | -28%（前次） |
+
+实测（4000 字节 / 1000 次读取，取最小值）：
+
+```
+优化前  308.6 µs/事件
+优化后  285.6 µs/事件   (-7.5%)
+```
+
+### 25.2 剩余空间评估
+
+| 方向 | 预期收益 | 代价 | 建议 |
+|---|---|---|---|
+| `getColumnData` 改用预编译闭包表 | ~5% | 可读性下降 | 可选 |
+| `bitGet`/`bitCount` 内联 | ~3% | 可读性下降 | 可选 |
+| 解析结果直接输出（跳过 Change 对象） | ~15% | **破坏 API 契约** | 不建议 |
+| 用 FFI 调 C 实现 | 未知 | 复杂度极高、可移植性差 | 不建议 |
+| 多线程解析 | — | binlog 天然串行 | 不可行 |
+
+**结论：解析层已接近 PHP 的合理上限。** 剩余可压榨的空间在 5% 量级，
+而网络（86%）和 handler IO 才是真正的大头。
+
+### 25.3 真要提升整体吞吐，优先级应该是
+
+1. **减少数据量**：列裁剪 + `only_configured`（已实现，收益最大）
+2. **减少事件数**：MySQL 端 `binlog_row_event_max_size` 调大
+3. **handler 批量写**：多值 INSERT 替代逐条（5–10 倍）
+4. **多机水平扩展**：按库/表拆分实例
+5. 解析层微调（< 5%）
+
+### 25.4 复现基准
+
+```bash
+php tests/bench.php          # EventBuilder / 序列化 / 点位
+php tests/netbench.php       # 网络 IO（sockets vs stream_socket）
+php tests/run-all.php        # 含 BinaryReaderTest / ColumnTypeTest
+```
