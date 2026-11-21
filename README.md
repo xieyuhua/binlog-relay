@@ -3,6 +3,19 @@
 用 PHP 写的轻量 MySQL binlog 中继框架，用于替代 **Canal / Maxwell / Debezium + Kafka** 这类重型 Java 链路。
 核心只有三件事：**读 binlog → 归一化 → 交给你的 handler**，加上可插拔的点位存储（Redis / 文件）和一键打包单文件二进制。
 
+> **两个实现，按需选择**
+>
+> | | 本目录（PHP） | [`v2-go/`](v2-go/)（Go） |
+> |---|---|---|
+> | 定位 | 中继 + 内置消费端 | 中继 + MQ 生态 |
+> | 输出 | Redis / HTTP / TCP / MySQL / CK / ES | Redis / **Kafka** / **RabbitMQ** / HTTP / MySQL / stdout |
+> | 消费端 | ✅ 内置 5 种 sink | ❌（依赖 MQ 消费者） |
+> | 吞吐 | 7–8k events/s | 更高（编译执行 + 更少分配） |
+> | 适用 | PHP 团队、单点同步 | 高吞吐、接入 MQ |
+>
+> 两者功能对齐（GTID 集合、DDL 同步、全量同步、列裁剪、多主题扇出），
+> 详见各自 README。
+
 底层 binlog 协议解析基于 [krowinski/php-mysql-replication](https://github.com/krowinski/php-mysql-replication)（纯 PHP 实现，支持 MySQL 5.5–8.0、MariaDB，含 `caching_sha2_password`）。
 
 ---

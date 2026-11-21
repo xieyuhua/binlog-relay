@@ -1,0 +1,13 @@
+# 构建产物
+/bin/
+*.exe
+*.test
+*.out
+
+# 位点与日志
+/var/
+*.log
+
+# 本地配置（含密码）
+/config.local.yaml
+.env

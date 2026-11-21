@@ -1,0 +1,21 @@
+# 复制为 config.yaml 后修改
+mysql:
+  host: 127.0.0.1
+  port: 3306
+  user: repl
+  password: "CHANGE_ME"
+  server_id: 8811        # 集群内必须唯一
+
+filter:
+  databases: [shop]
+  emit_ddl: false
+
+producer:
+  type: redis
+  redis:
+    addr: 127.0.0.1:6379
+    stream: binlog:events
+
+checkpoint:
+  driver: file
+  path: var/checkpoint.json
