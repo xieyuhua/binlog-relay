@@ -273,18 +273,99 @@ php bin/relay reset-position --force   # 从最新 binlog 末尾重新开始
 
 ## 8. 性能
 
+### 8.1 开销分布
+
+单事件（10 行、约 4KB）的实测耗时构成：
+
+| 环节 | 耗时 | 占比 |
+|---|---|---|
+| ① 网络读取 4KB | 51.5 µs | **86%** |
+| ② EventBuilder 构建 Change[] | 8.3 µs | 14% |
+| ③ 消息序列化 | 1.7 µs | — |
+
+**网络占大头，但那是等待 MySQL 返回数据的时间，不是 CPU 计算。**
+这意味着：换网络 IO 实现、换语言、上协程，都动不了这 86%。
+
+调优方向因此很明确：**减少数据量** 比 **加快处理速度** 有效得多。
+
+### 8.2 优化手段（按收益排序）
+
+| 手段 | 预期收益 | 成本 |
+|---|---|---|
+| **列裁剪**（第 17 章） | 含大字段时队列体积降 90%+ | 改配置 |
+| **`only_configured`**（第 19 章） | 未订阅表跳过解码与入队 | 改配置 |
+| **减少事件数量**：`binlog_row_event_max_size` 调大 | 单次读更多，减少往返 | 改 MySQL 配置 |
+| **handler 批量写**：多值 `INSERT` 替代逐条 | 5–10 倍 | 业务代码 |
+| **批量 XADD**（已内置） | 一次 pipeline 写整批 | 已完成 |
+| 换网络 IO 实现（swoole 等） | **< 3%** | 极高，见 8.4 |
+
+```ini
+# MySQL 端：默认值可能把大事务切成很多小块，调大可减少往返次数
+[mysqld]
+binlog_row_event_max_size = 8192
+net_read_timeout  = 3600
+net_write_timeout = 3600
+```
+
+### 8.3 参数建议
+
 | 维度 | 建议 |
 |---|---|
-| 单实例吞吐 | 实测约 7k–8k events/s（PHP 8.4 / MySQL 5.7，历史基准）；行变更越大越慢 |
+| 单实例吞吐 | 约 7k–8k events/s（PHP 8.4 / MySQL 5.7 基准）；行越大越慢 |
 | handler 耗时 | 单批超过 1s 会打 WARN，说明要做批量写或异步化 |
-| 大批量 | `RELAY_BATCH_SIZE=500` + handler 内 `INSERT ... VALUES (...),(...)` 批量 |
-| IO | 默认每 100 事件落一次点位，比每事件落盘快 10–100 倍 |
+| 大批量 | `RELAY_BATCH_SIZE=500` + 多值 INSERT |
+| 点位 IO | 默认每 100 事件落一次，比逐事件落盘快 10–100 倍 |
 | 内存 | 单批上限 8MB，超大事务自动切批；`memory_limit` 建议 512M |
-| 网络 | MySQL 端 `net_read_timeout/net_write_timeout` 建议调到 3600 |
 
-瓶颈通常不在解析而在 handler：**把逐条写改成批量写**，吞吐一般能翻 5–10 倍。
+纵向扩展：一个实例订阅一组库/表（`RELAY_DATABASES` / `RELAY_TABLES` 隔离），
+`slave_id` 与 `RELAY_CHECKPOINT_KEY` 各不相同。
 
-纵向扩展：一个实例一个库/一组表（`RELAY_DATABASES` 隔离），`slave_id` 各不相同。
+### 8.4 为什么不用 swoole 替换 sockets 扩展
+
+结论：**不会提升性能，不建议换。** 实测数据：
+
+| 实现 | 吞吐 | 单次耗时 |
+|---|---|---|
+| `sockets` 扩展（当前实现） | **19,424 次/秒** | 51.5 µs |
+| `stream_socket` | 18,803 次/秒 | 53.2 µs |
+
+（本地 TCP 回环，4KB 报文，2 万次往返。swoole 底层做的是同样的事，没有额外的优化空间。）
+
+数据可复现：
+
+```bash
+php tests/netbench.php          # 默认 20000 次 × 4096 字节
+php tests/netbench.php 50000 8192
+```
+
+四个原因：
+
+**1. 瓶颈是等待，不是 syscall**
+网络读取的 51.5 µs 里绝大部分在等 MySQL 返回数据。swoole 能省下的只是发起调用的几微秒。
+
+**2. binlog 协议天然串行**
+单连接、顺序读、顺序解析、顺序入队。swoole 的优势在**高并发连接**（数千客户端），
+而 relay 只维护 **1 个连接**，协程调度派不上用场。
+
+**3. 当前读法已是最优**
+```php
+socket_recv($this->socket, $buf, $length, MSG_WAITALL);
+```
+`MSG_WAITALL` 让内核等到凑满指定字节才返回，一次 syscall 拿完整报文。
+
+**4. 引入成本很实在**
+
+| 问题 | 影响 |
+|---|---|
+| 静态编译 | 二进制从 19.5 MB 涨到 40 MB 左右 |
+| Windows | swoole 不支持 Windows，打包流程失效 |
+| phar 兼容 | swoole 事件循环与 phpmicro 初始化顺序冲突 |
+| 代码改造 | 需在协程容器内运行，改动扩散到整个启动流程 |
+| 回归成本 | 内嵌解析库假定同步阻塞模型，每处都要重新验证 |
+
+**唯一值得考虑的场景**：一台机器要跑几十个 relay 实例。但当前架构支持
+单实例订阅多库 + `MultiStreamHandler` 扇出多 topic，本来就不需要多实例。
+真要扩到那个量级，正确做法是**多机部署**（每台 2–3 个实例），而不是把单进程改成协程。
 
 ---
 
@@ -565,7 +646,8 @@ php bin/consumer retry-dlq --limit=100     # 死信重投主队列
 
 ```bash
 php tests/run-all.php                   # 全量测试
-php tests/bench.php                     # 框架开销基准
+php tests/bench.php                     # 框架开销基准（EventBuilder / 序列化 / 点位）
+php tests/netbench.php                  # 网络 IO 基准（sockets vs stream_socket）
 ```
 
 ## 14. 方式 A：relay → Redis Stream → 框架消费
