@@ -90,3 +90,53 @@ func TestMultiTargetNoMatch(t *testing.T) {
 		t.Fatal("未命中任何规则时不应投递")
 	}
 }
+
+// labels 应按目标注入，且不同目标之间互不污染
+func TestMultiTargetLabelsIsolation(t *testing.T) {
+	rules := BuildRoutes([]config.TopicRule{
+		{Target: "prod", Tables: []string{"*"}, Labels: map[string]string{"env": "prod"}},
+		{Target: "stage", Tables: []string{"*"}, Labels: map[string]string{"env": "stage"}},
+	})
+
+	got := map[string]map[string]string{}
+	m := NewMultiTarget("test", rules, func(_ context.Context, target string, envs []*event.Envelope) error {
+		if len(envs) > 0 {
+			got[target] = envs[0].Labels
+		}
+		return nil
+	})
+
+	env := &event.Envelope{ID: "shop.orders:1", DB: "shop", Table: "orders", Op: "insert"}
+	if err := m.Send(context.Background(), []*event.Envelope{env}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got["prod"]["env"] != "prod" {
+		t.Errorf("prod labels = %v", got["prod"])
+	}
+	if got["stage"]["env"] != "stage" {
+		t.Errorf("stage labels = %v", got["stage"])
+	}
+	// 原始信封不应被污染
+	if env.Labels != nil {
+		t.Errorf("原始信封被修改: %v", env.Labels)
+	}
+}
+
+// 无 labels 的规则不应复制信封（零开销路径）
+func TestMultiTargetNoLabelsNoClone(t *testing.T) {
+	rules := BuildRoutes([]config.TopicRule{{Target: "t", Tables: []string{"*"}}})
+
+	var received *event.Envelope
+	m := NewMultiTarget("test", rules, func(_ context.Context, _ string, envs []*event.Envelope) error {
+		received = envs[0]
+		return nil
+	})
+
+	env := &event.Envelope{ID: "x", DB: "d", Table: "t", Op: "insert"}
+	_ = m.Send(context.Background(), []*event.Envelope{env})
+
+	if received != env {
+		t.Error("没有 labels 时应复用同一对象，避免无谓复制")
+	}
+}

@@ -72,6 +72,9 @@ type TopicRule struct {
 	Databases []string `yaml:"databases"`
 	Tables    []string `yaml:"tables"`
 	Ops       []string `yaml:"ops"`       // insert / update / delete / ddl
+	// Labels 是该 topic 专属的静态标签，合并进消息的 labels 字段。
+	// 消费端可据此区分来源/环境，例如 env=prod、source=mysql-main。
+	Labels map[string]string `yaml:"labels"`
 }
 
 type RedisConfig struct {

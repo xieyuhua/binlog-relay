@@ -49,7 +49,7 @@ final class CollectMessageSink implements MessageHandlerInterface
     public function handle(array $messages): void
     {
         foreach ($messages as $m) {
-            $this->ids[] = $m->id;
+            $this->ids[] = $m->entryId;
         }
     }
 }

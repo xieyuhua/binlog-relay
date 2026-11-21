@@ -35,7 +35,7 @@ final class MultiStreamHandler implements HandlerInterface
     private const MAX_LEN_APPROX = 200000;
 
     private Redis $redis;
-    /** @var list<array{stream:string,tables:list<string>,ops:list<string>,databases:list<string>}> */
+    /** @var list<array{stream:string,tables:list<string>,ops:list<string>,databases:list<string>,labels:array<string,string>}> */
     private array $routes;
 
     public function __construct(array $routes, ?Redis $redis = null, array $redisConfig = [])
@@ -44,11 +44,18 @@ final class MultiStreamHandler implements HandlerInterface
             if (empty($r['stream'])) {
                 throw new RuntimeException('fanout 规则缺少 stream');
             }
+            // labels：该 topic 专属的静态标签，会合并进消息顶层
+            $labels = [];
+            foreach ((array)($r['labels'] ?? []) as $k => $v) {
+                $labels[(string)$k] = (string)$v;
+            }
+
             return [
                 'stream'    => (string)$r['stream'],
                 'tables'    => array_map('strval', (array)($r['tables'] ?? [])),
                 'ops'       => array_map('strval', (array)($r['ops'] ?? [])),
                 'databases' => array_map('strval', (array)($r['databases'] ?? [])),
+                'labels'    => $labels,
             ];
         }, $routes);
 
@@ -88,7 +95,7 @@ final class MultiStreamHandler implements HandlerInterface
         foreach ($changes as $c) {
             foreach ($this->routes as $route) {
                 if ($this->matches($route, $c)) {
-                    $plan[] = [$route['stream'], Message::fromChange($c)];
+                    $plan[] = [$route['stream'], Message::fromChange($c, $route['labels'])];
                 }
             }
         }

@@ -142,8 +142,8 @@ check('快照 rowIdentity 可用', $change->rowIdentity() === 'demo.orders:1');
 check('快照无 before', $change->before === null);
 
 $fields = \BinlogRelay\Queue\Message::fromChange($change);
-check('快照消息字段与增量一致',
-    array_keys($fields) === ['op', 'db', 'tbl', 'pk', 'pos', 'ts', 'data']);
+check('快照消息为扁平结构',
+    isset($fields['id'], $fields['kind'], $fields['row']) && !isset($fields['data']));
 check('快照消息 op 为 insert', $fields['op'] === 'insert');
 
 echo $failed === 0 ? "\n全部通过\n" : "\n{$failed} 项失败\n";

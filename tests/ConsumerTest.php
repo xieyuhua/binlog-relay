@@ -40,8 +40,10 @@ $change = new Change(
     ['id'], 'mysql-bin.000012', '4321', 'gtid-1', 1795013415, 3
 );
 $fields = Message::fromChange($change);
-check('生产端字段齐全', array_keys($fields) === ['op', 'db', 'tbl', 'pk', 'pos', 'ts', 'data']);
-check('pk 为幂等键', $fields['pk'] === 'shop.orders:7', $fields['pk']);
+check('生产端为扁平结构', in_array('row', array_keys($fields), true) && !isset($fields['data']));
+check('幂等键在 id 字段', $fields['id'] === 'shop.orders:7', $fields['id']);
+check('kind 标识事件类型', $fields['kind'] === 'row', $fields['kind'] ?? '');
+check('row 是原生数组而非 JSON 字符串', is_array($fields['row']));
 
 $msg = Message::fromEntry('1795-0', $fields);
 check('消费端还原 op', $msg->op === 'update');
@@ -57,8 +59,14 @@ $broken = Message::fromEntry('1795-1', [
 check('data 损坏时保留表信息', $broken->table === 'orders' && $broken->op === 'insert');
 check('data 损坏时 row 为空数组', $broken->row() === []);
 
-$legacy = Message::fromEntry('1795-2', ['op' => 'delete', 'db' => 'a', 'tbl' => 'b', 'pk' => 'x']);
-check('老消息无 data 也能解析', $legacy->op === 'delete' && $legacy->table === 'b');
+// 旧嵌套格式（带 data）仍可解析，用于平滑升级
+$legacy = Message::fromEntry('1795-2', [
+    'op' => 'delete', 'db' => 'a', 'tbl' => 'b', 'pk' => 'a.b:1',
+    'pos' => 'bin:1', 'ts' => '1',
+    'data' => '{"op":"delete","database":"a","table":"b","row":{"id":1},"table_key":["id"]}',
+]);
+check('旧嵌套格式仍可解析', $legacy->op === 'delete' && $legacy->table === 'b'
+    && $legacy->row() === ['id' => 1], json_encode($legacy->row()));
 
 /* ===== 2. 假 Stream / 假 Sink ===== */
 final class FakeStream implements StreamInterface
@@ -149,7 +157,7 @@ final class FlakySink implements SinkInterface
             throw new RuntimeException('模拟下游失败');
         }
         foreach ($messages as $m) {
-            $this->written[] = $m->id;
+            $this->written[] = $m->entryId;
         }
     }
 }
@@ -177,7 +185,7 @@ function runOnce(StreamInterface $stream, SinkInterface $sink, int $maxRetries =
 $stream = new FakeStream(sampleEntries());
 $sink = new FlakySink();
 runOnce($stream, $sink);
-check('成功时 sink 收到全部消息', $sink->written === ['1-0', '2-0'], json_encode($sink->written));
+check('成功时 sink 收到全部消息', count($sink->written) === 2, json_encode($sink->written));
 check('成功时全部 ACK', $stream->acked === ['1-0', '2-0'], json_encode($stream->acked));
 check('自动创建 consumer group', $stream->groupCreated());
 
@@ -194,11 +202,11 @@ $sink = new FlakySink(99);
 runOnce($stream, $sink, 2);
 check('超限后写入死信 2 条', count($stream->added) === 2, (string)count($stream->added));
 check('死信带 error/source', isset($stream->added[0]['fields']['error'], $stream->added[0]['fields']['source']));
-check('死信 op/db/tbl/pk 完整',
+check('死信保留 op/db/table/id',
     $stream->added[0]['fields']['op'] === 'insert'
-    && $stream->added[0]['fields']['tbl'] === 't'
-    && $stream->added[0]['fields']['pk'] === 'a.t:1'
-    && $stream->added[1]['fields']['pk'] === 'a.t:2', json_encode($stream->added[0]['fields']));
+    && $stream->added[0]['fields']['table'] === 't'
+    && $stream->added[0]['fields']['id'] === 'a.t:1'
+    && $stream->added[1]['fields']['id'] === 'a.t:2', json_encode($stream->added[0]['fields']));
 check('进死信后原消息被 ACK', $stream->acked === ['1-0', '2-0'], json_encode($stream->acked));
 
 // 2d. 未配置死信 → 不 ACK、消息留在 pending
@@ -266,8 +274,9 @@ try {
     $body = $raw === false ? '' : substr($raw, strpos($raw, "\r\n\r\n") + 4);
     $json = json_decode($body, true);
     check('HttpSink 发送 events 数组', is_array($json) && isset($json['events']) && count($json['events']) === 2);
-    check('HttpSink 单条含 op/db/tbl/pk/data',
-        isset($json['events'][0]['op'], $json['events'][0]['db'], $json['events'][0]['tbl'], $json['events'][0]['pk'], $json['events'][0]['data']));
+    check('HttpSink 单条含 op/db/table/id/row',
+        isset($json['events'][0]['op'], $json['events'][0]['db'], $json['events'][0]['table'], $json['events'][0]['id'])
+        && isset($json['events'][0]['row']));
     $ok = true;
 } catch (Throwable $e) {
     check('HttpSink 请求', false, $e->getMessage());

@@ -27,6 +27,8 @@ type Route struct {
 	Databases map[string]struct{}
 	Tables    map[string]struct{}
 	Ops       map[string]struct{}
+	// Labels 命中该规则时附加到消息上
+	Labels map[string]string
 }
 
 // Match 判断某条记录是否命中该规则
@@ -60,6 +62,7 @@ func BuildRoutes(rules []config.TopicRule) []Route {
 			Databases: toSet(r.Databases),
 			Tables:    toSet(r.Tables),
 			Ops:       toSet(r.Ops),
+			Labels:    r.Labels,
 		})
 	}
 	return out
@@ -89,7 +92,10 @@ func (m *MultiTarget) Send(ctx context.Context, envs []*event.Envelope) error {
 	}
 
 	// 先按目标分组，再逐个目标批量投递：
-	// 避免逐条往返，也保证同一目标内的顺序
+	// 避免逐条往返，也保证同一目标内的顺序。
+	//
+	// 注意：同一记录可能命中多个目标，而每个目标的 labels 不同，
+	// 所以必须按目标复制 Envelope，否则会互相覆盖。
 	grouped := make(map[string][]*event.Envelope)
 	for _, env := range envs {
 		meta := event.TopicMeta{
@@ -98,9 +104,16 @@ func (m *MultiTarget) Send(ctx context.Context, envs []*event.Envelope) error {
 			Op:       env.Op,
 		}
 		for i := range m.routes {
-			if m.routes[i].Match(meta) {
-				grouped[m.routes[i].Target] = append(grouped[m.routes[i].Target], env)
+			if !m.routes[i].Match(meta) {
+				continue
 			}
+			target := m.routes[i].Target
+			moved := env
+			if len(m.routes[i].Labels) > 0 {
+				moved = env.Clone()
+				moved.Labels = m.routes[i].Labels
+			}
+			grouped[target] = append(grouped[target], moved)
 		}
 	}
 

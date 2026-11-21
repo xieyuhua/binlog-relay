@@ -19,3 +19,11 @@ producer:
 checkpoint:
   driver: file
   path: var/checkpoint.json
+
+# 多主题扇出示例（producer.type 为 redis/kafka/rabbitmq 时生效）
+# topics:
+#   - target: theme-a
+#     tables: [orders]
+#   - target: theme-b
+#     tables: ["*"]
+#     labels: {env: prod}

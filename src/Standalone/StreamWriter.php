@@ -45,12 +45,20 @@ final class StreamWriter implements HandlerInterface
         if ($topics === []) {
             $topics = [['stream' => (string)($cfg['stream'] ?? 'binlog:events')]];
         }
-        $this->routes = array_map(static fn(array $t) => [
-            'stream'    => (string)$t['stream'],
-            'tables'    => array_map('strval', (array)($t['tables'] ?? [])),
-            'ops'       => array_map('strval', (array)($t['ops'] ?? [])),
-            'databases' => array_map('strval', (array)($t['databases'] ?? [])),
-        ], $topics);
+        $this->routes = array_map(static function (array $t): array {
+            // labels：该 topic 专属静态标签，合并进消息顶层
+            $labels = [];
+            foreach ((array)($t['labels'] ?? []) as $k => $v) {
+                $labels[(string)$k] = (string)$v;
+            }
+            return [
+                'stream'    => (string)$t['stream'],
+                'tables'    => array_map('strval', (array)($t['tables'] ?? [])),
+                'ops'       => array_map('strval', (array)($t['ops'] ?? [])),
+                'databases' => array_map('strval', (array)($t['databases'] ?? [])),
+                'labels'    => $labels,
+            ];
+        }, $topics);
     }
 
     public function boot(): void
@@ -69,7 +77,7 @@ final class StreamWriter implements HandlerInterface
         foreach ($changes as $c) {
             foreach ($this->routes as $route) {
                 if ($this->matches($route, $c)) {
-                    $plan[] = [$route['stream'], Message::fromChange($c)];
+                    $plan[] = [$route['stream'], Message::fromChange($c, $route['labels'])];
                 }
             }
         }

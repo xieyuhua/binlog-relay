@@ -179,7 +179,7 @@ final class Consumer
         $this->stream->ack(
             $this->streamName,
             $this->group,
-            array_map(fn(Message $m) => $m->id, $batch)
+            array_map(fn(Message $m) => $m->entryId, $batch)
         );
     }
 
@@ -225,18 +225,29 @@ final class Consumer
 
         try {
             foreach ($batch as $m) {
-                $this->stream->add($this->deadLetterStream, [
-                    'op'        => $m->op,
-                    'db'        => $m->database,
-                    'tbl'       => $m->table,
-                    'pk'        => $m->pk,
-                    'pos'       => $m->pos,
-                    'ts'        => (string)$m->timestamp,
-                    'data'      => json_encode($m->data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}',
-                    'error'     => substr($e->getMessage(), 0, 500),
-                    'source'    => $this->streamName,
-                    'failed_at' => date('c'),
-                ]);
+                // 死信保留原始消息的全部字段（扁平格式），另加错误信息。
+                // 注意 id 是 Redis entry id（消费端用来 XACK），原始幂等键另存 original_id
+                $fields = $m->toArray();
+
+                $fields['row'] = json_encode($fields['row'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}';
+                $fields['before'] = $fields['before'] === null
+                    ? ''
+                    : (json_encode($fields['before'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}');
+                $fields['table_key'] = json_encode($fields['table_key'] ?? []) ?: '[]';
+                // labels 是关联数组，空时要编码成 {} 而非 []
+                $fields['labels'] = json_encode((object)($fields['labels'] ?? [])) ?: '{}';
+                $fields['ddl_tables'] = json_encode($fields['ddl_tables'] ?? []) ?: '[]';
+                $fields['error'] = substr($e->getMessage(), 0, 500);
+                $fields['source'] = $this->streamName;
+                $fields['failed_at'] = date('c');
+
+                // Redis Stream 只接受标量，全部转字符串
+                foreach ($fields as $k => $v) {
+                    if (!is_scalar($v) && $v !== null) {
+                        $fields[$k] = json_encode($v, JSON_UNESCAPED_UNICODE) ?: '';
+                    }
+                }
+                $this->stream->add($this->deadLetterStream, $fields);
             }
             $this->ack($batch);
             $this->logger->error(sprintf('已把 %d 条消息转入死信 %s', count($batch), $this->deadLetterStream));

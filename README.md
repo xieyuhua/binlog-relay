@@ -1906,3 +1906,91 @@ php bin/binlog2redis start
 
 剩下两个缺口（HA、监控）属于运维层面，需要 ZooKeeper/etcd 选主体系，
 不在本次范围内。当前单实例 + Redis 锁互斥已能满足大多数场景。
+
+---
+
+## 27. 队列消息格式与 topic 标签
+
+### 27.1 统一为扁平 JSON（PHP 与 Go 一致）
+
+两个版本输出的消息结构**完全相同**：
+
+```json
+{
+  "id": "shop.orders:7",
+  "kind": "row",
+  "op": "update",
+  "db": "shop",
+  "table": "orders",
+  "pos": "mysql-bin.000012:4321",
+  "ts": 1795013415,
+  "emitted_at": 1795013500,
+  "row": { "id": 7, "status": "paid" },
+  "before": { "id": 7, "status": "new" },
+  "table_key": ["id"],
+  "gtid": "uuid:2901",
+  "server_id": 1,
+  "labels": { "env": "prod" }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 幂等键 `库.表:主键值`（无键表为行哈希） |
+| `kind` | `row` / `ddl` |
+| `op` | `insert` / `update` / `delete` / `create_table` / ... |
+| `pos` | `mysql-bin.NNNNNN:position` |
+| `ts` | 源库事件时间 |
+| `emitted_at` | 中继落地时间 |
+| `row` / `before` | **原生 JSON 对象**，不是字符串 |
+| `table_key` | 主键/唯一键列名 |
+| `labels` | topic 级静态标签 |
+
+DDL 事件用 `ddl_tables` / `ddl_query` 字段，`kind` 为 `ddl`。
+
+**为什么改**：旧版把行数据塞进 `data` 字段（JSON 字符串），消费端要 `json_decode`
+两次，且引号被转义导致体积膨胀 30%。扁平化后只序列化一次。
+
+**兼容**：消费端仍能解析旧格式（带 `data` 字段），用于平滑升级。
+
+> Redis Stream 的每个字段都会存成字符串，所以 `row` 在 Redis 里是 JSON 文本；
+> 消费端读出来后 `json_decode` 一次即可。Kafka/RabbitMQ 存的是完整 JSON。
+
+### 27.2 topic 静态标签
+
+每条路由规则可以带 `labels`，命中时合并进消息顶层：
+
+```php
+// PHP: config/binlog2redis.php 或 config/relay.php
+'topics' => [
+    ['stream' => 'topic:order', 'tables' => ['orders']],
+    [
+        'stream' => 'topic:prod',
+        'tables' => ['*'],
+        'labels' => ['env' => 'prod', 'source' => 'mysql-main'],
+    ],
+],
+```
+
+```yaml
+# Go: config.yaml
+producer:
+  topics:
+    - target: topic-order
+      tables: [orders]
+    - target: topic-prod
+      tables: ["*"]
+      labels: {env: prod, source: mysql-main}
+```
+
+消费端据此区分来源：
+
+```php
+if (($msg->labels['env'] ?? '') === 'prod') {
+    // 生产环境专用的处理逻辑
+}
+```
+
+**实现细节**：一条变更可能命中多条规则，而每个规则的 labels 不同，
+所以 Go 版在分发时按目标**复制** Envelope（`Clone`），避免互相覆盖；
+未配置 labels 的规则不复制，走零开销路径。

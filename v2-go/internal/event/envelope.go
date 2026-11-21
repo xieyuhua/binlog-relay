@@ -52,6 +52,18 @@ type Envelope struct {
 	DDLTables []string `json:"ddl_tables,omitempty"`
 	// DDLQuery 完整 SQL 语句
 	DDLQuery string `json:"ddl_query,omitempty"`
+
+	// Labels 是 topic 级静态标签，由 producer 路由时注入。
+	// 消费端可据此区分来源/环境，例如 {"env":"prod","source":"mysql-main"}。
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// Clone 浅拷贝信封（Row/Before 是 map 引用，不深拷贝）。
+//
+// 用于多主题分发：每个目标可能附加不同的 labels，不能共用同一个指针。
+func (e *Envelope) Clone() *Envelope {
+	cp := *e
+	return &cp
 }
 
 // Marshal 直接用标准库编码，字段已是扁平结构，无需二次转换

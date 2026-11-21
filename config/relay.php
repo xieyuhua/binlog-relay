@@ -95,6 +95,10 @@ return [
         //     ['stream' => 'topic:stock',  'tables' => ['stock', 'stock_log']],
         //     ['stream' => 'topic:search', 'tables' => ['*']],                        // 全表
         //     ['stream' => 'topic:audit',  'tables' => ['orders'], 'ops' => ['delete']],
+        //
+        //     // 每个 topic 可带静态标签，合并进消息顶层（消费端据此区分来源/环境）
+        //     ['stream' => 'topic:prod', 'tables' => ['*'],
+        //      'labels' => ['env' => 'prod', 'source' => 'mysql-main']],
         // ], null, [
         //     'host'     => env('RELAY_REDIS_HOST', '127.0.0.1'),
         //     'port'     => (int) env('RELAY_REDIS_PORT', 6379),
