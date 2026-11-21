@@ -2145,3 +2145,81 @@ INSERT INTO consumed_ids (id) VALUES (?)   -- 主键冲突即已处理
 | `table_key` | array | 主键/唯一键列名 |
 | `labels` | object? | topic 级静态标签 |
 | `ddl_tables` / `ddl_query` | array/string | 仅 DDL 事件 |
+
+---
+
+## 29. 数据格式能不能自定义？
+
+**当前：格式是固定的，不提供模板配置。** 需要自定义时走自定义 Handler。
+
+### 29.1 现在能改的
+
+| 项 | 方式 |
+|---|---|
+| 加静态标签 | topic 规则的 `labels` 字段（见第 27.2 节） |
+| 过滤字段（不进队列） | `filter.columns` 列裁剪 |
+| 过滤表/库 | `filter.databases` / `filter.tables` / `only_configured` |
+| 换输出后端 | `producer.type`（Redis/Kafka/RabbitMQ/HTTP/MySQL） |
+| 改字段名 / 嵌套结构 | ❌ 需自定义 Handler |
+
+### 29.2 要完全自定义怎么办
+
+用自定义 Handler，自己决定写什么：
+
+```php
+final class MyFormatter implements HandlerInterface
+{
+    private \Redis $redis;
+
+    public function __construct()
+    {
+        $this->redis = new \Redis();
+        $this->redis->connect('127.0.0.1', 6379);
+    }
+
+    public function handle(array $changes): void
+    {
+        foreach ($changes as $c) {
+            // 完全自定义：字段名、结构、类型都自己定
+            $this->redis->xAdd('my:topic', '*', [
+                'table'   => $c->table,
+                'orderId' => (string)($c->row['id'] ?? ''),
+                'payload' => json_encode([
+                    'amount' => $c->row['amount'] ?? null,
+                    'status' => $c->row['status'] ?? null,
+                ], JSON_UNESCAPED_UNICODE),
+            ]);
+        }
+    }
+}
+```
+
+```php
+// config/relay.php
+'handlers' => [App\MyFormatter::class],
+```
+
+### 29.3 代价
+
+自定义 Handler **绕过了队列契约**，因此失去：
+
+| 能力 | 原因 |
+|---|---|
+| 内置消费端（`bin/consumer`） | 它按固定字段解析 |
+| 全量同步（`fullsync`） | 快照消息用同一格式，你的 Handler 不认 |
+| 多主题扇出 | 路由按 `db`/`table`/`op` 判定，需自行实现 |
+| 位点续传 | 仍可用（由 Subscriber 维护，与 Handler 无关） |
+
+如果只改少量字段，更好的做法是**在消费端做适配**而不是改生产格式——
+生产格式保持统一，消费端各写各的映射。
+
+### 29.4 为什么不做模板配置
+
+考虑过「字段映射模板」（如 `{order_id: row.id, stat: row.status}`），没做是因为：
+
+1. **破坏两版一致性**：PHP 和 Go 要各实现一套模板引擎，容易漂移
+2. **调试成本高**：模板出错时，错误信息会指向配置而不是代码
+3. **需求不明确**：真需要自定义格式的场景，往往逻辑比映射复杂
+   （要计算、要合并多行、要查表），模板最终会退化成一个 DSL
+
+自定义 Handler 用 20 行代码就能覆盖所有场景，且是强类型的。
