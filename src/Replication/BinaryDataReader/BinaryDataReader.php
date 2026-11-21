@@ -38,9 +38,16 @@ class BinaryDataReader
 
     private int $readBytes = 0;
 
+    /** 当前读取位置。用偏移量代替每次 substr 复制整个剩余缓冲区（O(n²) → O(n)） */
+    private int $offset = 0;
+
+    /** 数据总长度，避免反复 strlen() */
+    private int $length;
+
     public function __construct(
         private string $binaryData
     ) {
+        $this->length = strlen($binaryData);
     }
 
     public static function pack64bit(int $value): string
@@ -70,17 +77,47 @@ class BinaryDataReader
 
     public function read(int $length): string
     {
-        $return = substr($this->binaryData, 0, $length);
+        $return = substr($this->binaryData, $this->offset, $length);
+        $this->offset += $length;
         $this->readBytes += $length;
-        $this->binaryData = substr($this->binaryData, $length);
+
+        // 请求长度超过剩余数据时 offset 会越过末尾，
+        // 钳制到末尾，避免 getBinaryDataLength() 返回负数
+        if ($this->offset > $this->length) {
+            $this->offset = $this->length;
+        }
 
         return $return;
     }
 
+    /**
+     * 回退数据
+     *
+     * 注意：调用方（RowEvent 的有符号数值处理）退回的是**重新编码后的字节**，
+     * 而不是原始字节，所以不能用偏移量回退，必须把数据拼回缓冲区。
+     * 只在少数数值类型上调用，开销可忽略。
+     */
+    /**
+     * 退回数据
+     *
+     * 语义与原实现（$data . 剩余缓冲区）严格一致：
+     * 把已读位置之后的剩余部分与新数据拼起来，等价于「用新数据替换刚读的那段」。
+     *
+     * 注意不能退回到 offset 之前再 substr_replace，那样在连续 unread 时
+     * 会因为长度参数错位而丢字节（已由测试覆盖）。
+     */
     public function unread(string $data): void
     {
-        $this->readBytes -= strlen($data);
-        $this->binaryData = $data . $this->binaryData;
+        $length = strlen($data);
+        $this->readBytes -= $length;
+
+        $remaining = substr($this->binaryData, $this->offset);
+        $this->binaryData = substr($this->binaryData, 0, $this->offset - $length) . $data . $remaining;
+        $this->offset -= $length;
+        if ($this->offset < 0) {
+            $this->offset = 0;
+        }
+        $this->length = strlen($this->binaryData);
     }
 
     public function readCodedBinary(): ?int
@@ -294,14 +331,16 @@ class BinaryDataReader
         return !($this->readBytes - 20 < $size);
     }
 
+    /** 剩余未读长度（调用方用于判断是否读到头） */
     public function getBinaryDataLength(): int
     {
-        return strlen($this->binaryData);
+        return $this->length - $this->offset;
     }
 
+    /** 剩余未读数据 */
     public function getBinaryData(): string
     {
-        return $this->binaryData;
+        return substr($this->binaryData, $this->offset);
     }
 
     public function getBinarySlice(int $binary, int $start, int $size, int $binaryLength): int

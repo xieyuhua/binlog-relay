@@ -18,6 +18,8 @@ $tests = [
     'Redis API 契约' => __DIR__ . '/RedisApiTest.php',
     '自定义 Sink' => __DIR__ . '/CustomSinkTest.php',
     '脚本处理器' => __DIR__ . '/ScriptHandlerTest.php',
+    '二进制读取器' => __DIR__ . '/BinaryReaderTest.php',
+    '列类型解码' => __DIR__ . '/ColumnTypeTest.php',
 ];
 
 $failed = 0;
