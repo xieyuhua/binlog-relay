@@ -38,10 +38,10 @@ type MySQLConfig struct {
 }
 
 type FilterConfig struct {
-	Databases      []string `yaml:"databases"`
-	Tables         []string `yaml:"tables"`
+	Databases       []string `yaml:"databases"`
+	Tables          []string `yaml:"tables"`
 	IgnoreDatabases []string `yaml:"ignore_databases"`
-	IgnoreTables   []string `yaml:"ignore_tables"`
+	IgnoreTables    []string `yaml:"ignore_tables"`
 
 	// OnlyConfigured 只处理 tables 或 columns 里出现过的表
 	OnlyConfigured bool `yaml:"only_configured"`
@@ -59,19 +59,19 @@ type ProducerConfig struct {
 	// 多主题扇出（redis/kafka/rabbitmq 通用）
 	Topics []TopicRule `yaml:"topics"`
 
-	Redis   RedisConfig   `yaml:"redis"`
-	Kafka   KafkaConfig   `yaml:"kafka"`
-	Rabbit  RabbitConfig  `yaml:"rabbitmq"`
-	HTTP    HTTPConfig    `yaml:"http"`
-	MySQL   MySQLSink     `yaml:"mysqlsink"`
+	Redis  RedisConfig  `yaml:"redis"`
+	Kafka  KafkaConfig  `yaml:"kafka"`
+	Rabbit RabbitConfig `yaml:"rabbitmq"`
+	HTTP   HTTPConfig   `yaml:"http"`
+	MySQL  MySQLSink    `yaml:"mysqlsink"`
 }
 
 // TopicRule 让一条变更可以路由到不同目标
 type TopicRule struct {
-	Target    string   `yaml:"target"`    // 必填：stream / topic / queue / routing_key
+	Target    string   `yaml:"target"` // 必填：stream / topic / queue / routing_key
 	Databases []string `yaml:"databases"`
 	Tables    []string `yaml:"tables"`
-	Ops       []string `yaml:"ops"`       // insert / update / delete / ddl
+	Ops       []string `yaml:"ops"` // insert / update / delete / ddl
 	// Labels 是该 topic 专属的静态标签，合并进消息的 labels 字段。
 	// 消费端可据此区分来源/环境，例如 env=prod、source=mysql-main。
 	Labels map[string]string `yaml:"labels"`
@@ -98,9 +98,9 @@ type KafkaConfig struct {
 }
 
 type RabbitConfig struct {
-	URL       string `yaml:"url"`
-	Exchange  string `yaml:"exchange"`
-	Queue     string `yaml:"queue"`
+	URL        string `yaml:"url"`
+	Exchange   string `yaml:"exchange"`
+	Queue      string `yaml:"queue"`
 	RoutingKey string `yaml:"routing_key"`
 	// Durable 队列/交换机持久化
 	Durable bool `yaml:"durable"`

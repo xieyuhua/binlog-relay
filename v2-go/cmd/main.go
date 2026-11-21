@@ -104,6 +104,11 @@ func runStart(ctx context.Context, cfg *config.Config, log *slog.Logger, seconds
 	}
 	defer store.ReleaseLock(ctx, owner)
 
+	// Redis 锁有 TTL，必须定期续期；否则运行超过 TTL 后锁会失效，
+	// 另一实例启动时就能抢到锁，造成双消费（文件锁不依赖 TTL，无需续期）。
+	stopRefresh := startLockRefresh(ctx, store, owner, log)
+	defer stopRefresh()
+
 	prod, err := producer.New(cfg)
 	if err != nil {
 		log.Error("初始化输出端失败", "err", err)
@@ -373,6 +378,34 @@ func runCheck(ctx context.Context, cfg *config.Config, log *slog.Logger) int {
 }
 
 // ---------- 辅助 ----------
+
+// startLockRefresh 每 20 秒续期一次（TTL 60 秒，留足余量）。
+// 返回的函数用于停止续期。
+func startLockRefresh(
+	ctx context.Context, store checkpoint.Store, owner string, log *slog.Logger,
+) func() {
+	refreshCtx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-ticker.C:
+				if err := store.RefreshLock(refreshCtx, owner, 60*time.Second); err != nil {
+					// 续期失败通常意味着 Redis 短暂不可用；下一轮会重试。
+					// 若持续失败，锁会过期，需要人工介入。
+					log.Warn("锁续期失败", "err", err)
+				}
+			}
+		}
+	}()
+
+	return cancel
+}
 
 func buildStore(ctx context.Context, cfg *config.Config) (checkpoint.Store, error) {
 	if cfg.Checkpoint.Driver == "redis" {

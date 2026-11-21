@@ -10,10 +10,10 @@ import (
 
 func TestRouteMatch(t *testing.T) {
 	cases := []struct {
-		name  string
-		rule  config.TopicRule
-		meta  event.TopicMeta
-		want  bool
+		name string
+		rule config.TopicRule
+		meta event.TopicMeta
+		want bool
 	}{
 		{"全表通配", config.TopicRule{Tables: []string{"*"}}, event.TopicMeta{Table: "orders"}, true},
 		{"表名命中", config.TopicRule{Tables: []string{"orders"}}, event.TopicMeta{Table: "orders"}, true},

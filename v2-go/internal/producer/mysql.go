@@ -14,6 +14,10 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
+// columnKeySep 是列集合分组键的分隔符。
+// 用不可见字符避免与列名冲突（列名不可能包含控制字符）。
+const columnKeySep = "\x00"
+
 // MySQL 把变更写入镜像表。
 //
 // 表名规则：prefix + 源表名（如 mirror_orders）
@@ -28,7 +32,7 @@ type MySQL struct {
 	prefix string
 	batch  int
 
-	mu      sync.RWMutex
+	mu       sync.RWMutex
 	keyCache map[string][]string
 }
 
@@ -142,8 +146,19 @@ func (m *MySQL) writeChunk(ctx context.Context, envs []*event.Envelope) error {
 func (m *MySQL) targetTable(table string) string { return m.prefix + table }
 
 func (m *MySQL) upsert(ctx context.Context, tx *sql.Tx, table string, rows []map[string]any) error {
-	cols := make([]string, 0, len(rows[0]))
-	for c := range rows[0] {
+	// 取所有行的列并集。
+	//
+	// 不能只用 rows[0] 的列：列裁剪或 schema 变更后，同一批里不同行的
+	// 列集合可能不同。若只按第一行的列拼 SQL，后面缺列的行会被写成 NULL，
+	// 覆盖掉目标表里的真实值。
+	colSet := make(map[string]struct{})
+	for _, row := range rows {
+		for c := range row {
+			colSet[c] = struct{}{}
+		}
+	}
+	cols := make([]string, 0, len(colSet))
+	for c := range colSet {
 		cols = append(cols, c)
 	}
 	sort.Strings(cols) // 列顺序固定，便于复用预编译语句
@@ -164,6 +179,73 @@ func (m *MySQL) upsert(ctx context.Context, tx *sql.Tx, table string, rows []map
 	for _, k := range keys {
 		keySet[k] = struct{}{}
 	}
+	for _, c := range cols {
+		if _, isKey := keySet[c]; isKey {
+			continue
+		}
+		q := "`" + strings.ReplaceAll(c, "`", "``") + "`"
+		updates = append(updates, q+"=VALUES("+q+")")
+	}
+
+	// 按「列集合」分组：列集合相同的行才能共用一条多值 INSERT。
+	//
+	// 缺列的行不能简单补 NULL——那会把目标表里的值覆盖掉。
+	// 正确做法是只用该行实际拥有的列拼 SQL，未提及的列保持原值。
+	type colGroup struct {
+		cols []string
+		rows []map[string]any
+	}
+	groups := make(map[string]*colGroup)
+
+	for _, row := range rows {
+		rowCols := make([]string, 0, len(row))
+		for c := range row {
+			rowCols = append(rowCols, c)
+		}
+		sort.Strings(rowCols)
+		key := strings.Join(rowCols, columnKeySep)
+
+		g, ok := groups[key]
+		if !ok {
+			g = &colGroup{cols: rowCols}
+			groups[key] = g
+		}
+		g.rows = append(g.rows, row)
+	}
+
+	// 列集合的 key 排序，保证执行顺序稳定
+	groupKeys := make([]string, 0, len(groups))
+	for k := range groups {
+		groupKeys = append(groupKeys, k)
+	}
+	sort.Strings(groupKeys)
+
+	for _, key := range groupKeys {
+		g := groups[key]
+		if err := m.insertGroup(ctx, tx, table, g.cols, g.rows, keySet); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// insertGroup 对列集合相同的一组行执行多值 INSERT
+func (m *MySQL) insertGroup(
+	ctx context.Context, tx *sql.Tx, table string,
+	cols []string, rows []map[string]any, keySet map[string]struct{},
+) error {
+	if len(cols) == 0 || len(rows) == 0 {
+		return nil
+	}
+
+	quoted := make([]string, len(cols))
+	placeholders := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = "`" + strings.ReplaceAll(c, "`", "``") + "`"
+		placeholders[i] = "?"
+	}
+
+	updates := make([]string, 0, len(cols))
 	for _, c := range cols {
 		if _, isKey := keySet[c]; isKey {
 			continue

@@ -36,7 +36,7 @@ func main() {
 		MinBytes: 1,
 		MaxBytes: 10 << 20, // 10MB
 		// 一批最多等 1 秒，兼顾吞吐与延迟
-		MaxWait:  time.Second,
+		MaxWait: time.Second,
 	})
 	defer reader.Close()
 

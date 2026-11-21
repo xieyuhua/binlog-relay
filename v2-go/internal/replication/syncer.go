@@ -17,8 +17,8 @@ import (
 	"github.com/biaoge/binlog2redis/internal/producer"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	"github.com/google/uuid"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
 )
 
 // Syncer 串联整条链路：读 binlog → 归一化 → 过滤 → 投递 → 推进位点。
@@ -46,18 +46,23 @@ type Syncer struct {
 	gtidSet   *checkpoint.GtidSet
 	eventsCnt atomic.Int64
 	running   atomic.Bool
+
+	// 位点落盘控制：按事件数或时间间隔批量写，避免每事务一次 IO
+	eventsSincePersist int
+	lastPersistAt      time.Time
 }
 
 // NewSyncer 构造同步器
 func NewSyncer(cfg *config.Config, log *slog.Logger,
 	prod producer.Producer, store checkpoint.Store) *Syncer {
 	return &Syncer{
-		cfg:      cfg,
-		log:      log,
-		parser:   NewParser(filter.New(cfg.Filter), cfg.Filter.EmitDDL),
-		producer: prod,
-		store:    store,
-		lastFlush: time.Now(),
+		cfg:           cfg,
+		log:           log,
+		parser:        NewParser(filter.New(cfg.Filter), cfg.Filter.EmitDDL),
+		producer:      prod,
+		store:         store,
+		lastFlush:     time.Now(),
+		lastPersistAt: time.Now(),
 	}
 }
 
@@ -67,11 +72,18 @@ func (s *Syncer) Run(ctx context.Context) error {
 		return err
 	}
 	defer func() {
-		// 退出前把缓冲与位点落盘
-		if err := s.flush(context.Background()); err != nil {
-			s.log.Error("退出前刷新失败", "err", err)
+		// 退出前把缓冲投递出去，并保存位点。
+		// 用独立 ctx：此时 ctx 通常已取消，但清理必须完成。
+		cleanupCtx := context.WithoutCancel(ctx)
+
+		if len(s.buf) > 0 {
+			s.log.Info("退出前还有未投递的数据", "count", len(s.buf))
+			if err := s.flush(cleanupCtx); err != nil {
+				s.log.Error("退出前投递失败，这些数据会由重启后重放",
+					"count", len(s.buf), "err", err)
+			}
 		}
-		if err := s.persist(context.Background()); err != nil {
+		if err := s.persist(cleanupCtx); err != nil {
 			s.log.Error("退出前保存位点失败", "err", err)
 		}
 	}()
@@ -262,12 +274,17 @@ func (s *Syncer) handleEvent(ctx context.Context, be *replication.BinlogEvent) e
 		}
 
 	case *replication.XIDEvent:
-		// 事务结束：把缓冲刷出去，再推进位点
+		// 事务结束：把缓冲刷出去
 		if err := s.flush(ctx); err != nil {
 			return err
 		}
-		if err := s.persist(ctx); err != nil {
-			return err
+		// 位点按配置的节奏落盘：每 N 个事件或每 N 秒，
+		// 避免高并发小事务下单事务一次 IO
+		s.eventsSincePersist++
+		if s.shouldPersist() {
+			if err := s.persist(ctx); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -339,6 +356,13 @@ func (s *Syncer) append(ctx context.Context, rec event.Record) error {
 }
 
 // flush 把缓冲交给 producer
+// flush 把缓冲交给 producer，失败时带指数退避重试。
+//
+// 为什么不能直接返回错误让进程退出：
+// 下游（Redis/Kafka）临时不可用是常态，退出会导致缓冲区里的数据丢失，
+// 且位点已推进到这批之前——下次启动虽然能重读，但当前进程已丢数据。
+//
+// 重试耗尽后仍然失败才退出，此时位点未推进，重启会重新读取。
 func (s *Syncer) flush(ctx context.Context) error {
 	if len(s.buf) == 0 {
 		return nil
@@ -349,16 +373,68 @@ func (s *Syncer) flush(ctx context.Context) error {
 	s.bufRows = 0
 	s.lastFlush = time.Now()
 
-	if err := s.producer.Send(ctx, batch); err != nil {
-		// 投递失败：把数据放回缓冲，位点不推进，下一轮重试
-		s.buf = append(batch, s.buf...)
-		s.bufRows = len(s.buf)
-		return fmt.Errorf("投递失败（%d 条）: %w", len(batch), err)
+	const maxAttempts = 5
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// 用独立的超时，避免 ctx 已取消时无法完成最后一次尝试
+		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		err := s.producer.Send(sendCtx, batch)
+		cancel()
+
+		if err == nil {
+			s.eventsCnt.Add(int64(len(batch)))
+			s.log.Debug("已投递", "count", len(batch), "total", s.eventsCnt.Load())
+			return nil
+		}
+
+		lastErr = err
+
+		if attempt == maxAttempts {
+			break
+		}
+
+		// 指数退避：1s, 2s, 4s, 8s
+		backoff := time.Duration(1<<(attempt-1)) * time.Second
+		s.log.Warn("投递失败，稍后重试",
+			"attempt", attempt, "max", maxAttempts,
+			"count", len(batch), "backoff", backoff, "err", err)
+
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			// 收到停止信号：把数据放回缓冲，让 defer 里的最后一次 flush 处理
+			s.buf = append(batch, s.buf...)
+			s.bufRows = len(s.buf)
+			return fmt.Errorf("收到停止信号时投递未完成: %w", lastErr)
+		}
 	}
 
-	s.eventsCnt.Add(int64(len(batch)))
-	s.log.Debug("已投递", "count", len(batch), "total", s.eventsCnt.Load())
-	return nil
+	// 重试耗尽：放回缓冲（供日志/排障），返回错误让上层退出
+	s.buf = append(batch, s.buf...)
+	s.bufRows = len(s.buf)
+	return fmt.Errorf("投递失败，重试 %d 次后放弃（%d 条）: %w", maxAttempts, len(batch), lastErr)
+}
+
+// shouldPersist 判断是否该把位点落盘。
+//
+// 两个条件先到先触发：
+//   - 累计事件数达到 every_events
+//   - 距上次落盘超过 every_seconds
+//
+// 都未配置时每 100 事件或 1 秒落一次（默认值）。
+func (s *Syncer) shouldPersist() bool {
+	everyEvents := s.cfg.Checkpoint.EveryEvents
+	if everyEvents <= 0 {
+		everyEvents = 100
+	}
+	everySeconds := s.cfg.Checkpoint.EverySeconds
+	if everySeconds <= 0 {
+		everySeconds = time.Second
+	}
+
+	return s.eventsSincePersist >= everyEvents ||
+		time.Since(s.lastPersistAt) >= everySeconds
 }
 
 // persist 保存位点
@@ -381,6 +457,9 @@ func (s *Syncer) persist(ctx context.Context) error {
 	if err := s.store.Save(ctx, &pos); err != nil {
 		return fmt.Errorf("保存位点失败: %w", err)
 	}
+
+	s.eventsSincePersist = 0
+	s.lastPersistAt = time.Now()
 	return nil
 }
 

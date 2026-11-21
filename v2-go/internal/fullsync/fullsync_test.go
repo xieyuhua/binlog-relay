@@ -22,8 +22,8 @@ func (f *fakeProducer) Send(_ context.Context, envs []*event.Envelope) error {
 	}
 	return nil
 }
-func (f *fakeProducer) Name() string  { return "fake" }
-func (f *fakeProducer) Close() error  { return nil }
+func (f *fakeProducer) Name() string { return "fake" }
+func (f *fakeProducer) Close() error { return nil }
 
 // cursorPage 是 SyncTable 分页逻辑的等价实现，用于验证不重不漏
 func cursorPage(ctx context.Context, db *sql.DB, table string, keys []string, batch int) ([]string, error) {

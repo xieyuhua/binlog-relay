@@ -34,11 +34,11 @@ import (
 //
 // 反过来做（先快照后记位点）会丢掉快照期间的变更。
 type Syncer struct {
-	db      *sql.DB
-	log     *slog.Logger
-	prod    producer.Producer
-	batch   int
-	prefix  string
+	db     *sql.DB
+	log    *slog.Logger
+	prod   producer.Producer
+	batch  int
+	prefix string
 	// flushSize 攒够多少条投递一次；太小会导致大量小批次
 	flushSize int
 }

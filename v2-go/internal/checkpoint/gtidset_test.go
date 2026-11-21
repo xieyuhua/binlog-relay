@@ -82,7 +82,7 @@ func TestGtidSetInvalid(t *testing.T) {
 }
 
 func TestGtidSetRoundTrip(t *testing.T) {
-	orig := sidB + ":1-100," + sidA + ":1-3:8:10-12"  // 输出按 SID 字典序
+	orig := sidB + ":1-100," + sidA + ":1-3:8:10-12" // 输出按 SID 字典序
 	g, err := ParseGtidSet(orig)
 	if err != nil {
 		t.Fatal(err)

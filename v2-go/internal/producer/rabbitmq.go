@@ -15,16 +15,16 @@ import (
 // RabbitMQ 把事件发布到交换机。
 //
 // 关键取舍：
-// - 开启 publisher confirm 后，Publish 返回即代表 broker 已确认，
-//   不会静默丢消息；代价是每批一次往返
-// - 消息设为 persistent，配合 durable 队列可抵抗 broker 重启
-// - 多主题模式用 routing key 区分，消费端按 binding key 订阅
+//   - 开启 publisher confirm 后，Publish 返回即代表 broker 已确认，
+//     不会静默丢消息；代价是每批一次往返
+//   - 消息设为 persistent，配合 durable 队列可抵抗 broker 重启
+//   - 多主题模式用 routing key 区分，消费端按 binding key 订阅
 type RabbitMQ struct {
 	cfg config.RabbitConfig
 
-	mu      sync.Mutex
-	conn    *amqp.Connection
-	channel *amqp.Channel
+	mu       sync.Mutex
+	conn     *amqp.Connection
+	channel  *amqp.Channel
 	confirms chan amqp.Confirmation
 
 	multi *MultiTarget

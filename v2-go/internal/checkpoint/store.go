@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -90,18 +93,65 @@ func (f *FileStore) Save(_ context.Context, p *Position) error {
 	return os.Rename(tmp, f.path) // 原子替换，读侧永远看到完整内容
 }
 
+// AcquireLock 用 O_EXCL 创建锁文件。
+//
+// 进程崩溃后锁文件会残留，所以这里会检查持有者是否还活着：
+// 同机进程用 signal 0 探测，探测失败则视为陈旧锁并清理。
 func (f *FileStore) AcquireLock(_ context.Context, owner string, _ time.Duration) (bool, error) {
 	lockPath := f.path + ".lock"
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
+
+	for attempt := 0; attempt < 2; attempt++ {
+		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			defer file.Close()
+			_, _ = fmt.Fprintf(file, "%s\n%d\n%s", owner, os.Getpid(), time.Now().Format(time.RFC3339))
+			return true, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return false, err
+		}
+
+		// 锁已存在：检查持有者是否还活着
+		alive, pid := lockHolderAlive(lockPath)
+		if alive {
 			return false, nil
 		}
-		return false, err
+
+		// 陈旧锁：删除后重试一次
+		fmt.Fprintf(os.Stderr, "检测到陈旧锁（pid=%d 已不存在），清理后继续\n", pid)
+		if err := os.Remove(lockPath); err != nil {
+			return false, fmt.Errorf("清理陈旧锁失败: %w", err)
+		}
 	}
-	defer file.Close()
-	_, _ = fmt.Fprintf(file, "%s %d", owner, os.Getpid())
-	return true, nil
+
+	return false, nil
+}
+
+// lockHolderAlive 判断锁文件里的进程是否仍存在。
+// 跨主机场景无法探测，保守返回 true（需人工 `reset-position --force`）。
+func lockHolderAlive(lockPath string) (bool, int) {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return false, 0
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 2 {
+		return false, 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(lines[1]))
+	if err != nil || pid <= 0 {
+		return false, 0
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false, pid
+	}
+	// Unix 下 signal 0 只探测存在性；Windows 上 FindProcess 本身即可
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return false, pid
+	}
+	return true, pid
 }
 
 func (f *FileStore) RefreshLock(context.Context, string, time.Duration) error { return nil }

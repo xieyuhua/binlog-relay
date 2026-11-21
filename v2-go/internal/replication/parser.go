@@ -20,7 +20,7 @@ import (
 // - 列裁剪在构造 Change 之前完成，避免多余的对象分配
 // - 所有 map 值都做 JSON 安全化（二进制转 base64）
 type Parser struct {
-	filter *filter.Filter
+	filter  *filter.Filter
 	emitDDL bool
 
 	mu sync.RWMutex
@@ -366,4 +366,3 @@ var encodeBase64 = func(b []byte) string { return b64.EncodeToString(b) }
 func isUTF8(b []byte) bool {
 	return utf8.Valid(b)
 }
-
