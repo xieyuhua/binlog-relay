@@ -31,6 +31,7 @@ import (
 	"github.com/biaoge/binlog2redis/internal/logx"
 	"github.com/biaoge/binlog2redis/internal/producer"
 	"github.com/biaoge/binlog2redis/internal/replication"
+	"github.com/biaoge/binlog2redis/internal/version"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -47,6 +48,7 @@ func main() {
 	dryRun := fs.Bool("dry-run", false, "只列出待同步的表，不推送")
 	tables := fs.String("tables", "", "只同步指定表，逗号分隔")
 	force := fs.Bool("force", false, "重置位点时强制覆盖")
+	alertTest := fs.Bool("alert-test", false, "发送一条测试告警，验证配置")
 	_ = fs.Parse(os.Args[2:])
 
 	cfg, err := config.Load(resolveConfigPath(*configPath))
@@ -72,7 +74,9 @@ func main() {
 	case "reset-position":
 		code = runReset(ctx, cfg, logger, *force)
 	case "check":
-		code = runCheck(ctx, cfg, logger)
+		code = runCheck(ctx, cfg, logger, *alertTest)
+	case "version", "--version", "-v":
+		showVersion()
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -310,7 +314,7 @@ func runReset(ctx context.Context, cfg *config.Config, log *slog.Logger, force b
 	return 0
 }
 
-func runCheck(ctx context.Context, cfg *config.Config, log *slog.Logger) int {
+func runCheck(ctx context.Context, cfg *config.Config, log *slog.Logger, alertTest bool) int {
 	ok := true
 
 	// 1. MySQL
@@ -375,12 +379,54 @@ func runCheck(ctx context.Context, cfg *config.Config, log *slog.Logger) int {
 		prod.Close()
 	}
 
+	// 4. 告警通道：配置校验 + 可选发送测试
+	if !cfg.Alert.Enabled() {
+		fmt.Println("[WARN] 未配置告警通道（企微/钉钉），故障时只能看日志")
+	} else {
+		if cfg.Alert.WeCom.Key != "" {
+			key := cfg.Alert.WeCom.Key
+			if len(key) > 8 {
+				key = key[:8]
+			}
+			fmt.Printf("[OK]   企微告警已配置（key: %s...）\n", key)
+		}
+		if cfg.Alert.DingTalk.Token != "" {
+			mode := "IP 白名单"
+			if cfg.Alert.DingTalk.Secret != "" {
+				mode = "加签"
+			} else if cfg.Alert.DingTalk.Keyword != "" {
+				mode = "关键词"
+			}
+			fmt.Printf("[OK]   钉钉告警已配置（安全模式：%s）\n", mode)
+		}
+
+		if alertTest {
+			buildAlerter(cfg, log).Alert(
+				"check-test",
+				"binlog2redis 告警测试",
+				"收到这条消息说明告警通道配置正确。",
+				map[string]string{"主机": hostname(), "时间": time.Now().Format("2006-01-02 15:04:05")},
+			)
+			fmt.Println("[OK]   测试告警已发送，请检查群消息")
+		} else {
+			fmt.Println("[WARN] 加 --alert-test 可发送一条测试告警，验证配置是否生效")
+		}
+	}
+
 	if ok {
 		fmt.Println("\n自检通过")
 		return 0
 	}
 	fmt.Println("\n自检未通过，请修复上面的 FAIL 项")
 	return 1
+}
+
+// showVersion 打印版本与环境信息
+func showVersion() {
+	fmt.Printf("binlog2redis %s\n", version.String())
+	for k, v := range version.Environment() {
+		fmt.Printf("  %-7s %s\n", k, v)
+	}
 }
 
 // ---------- 辅助 ----------
@@ -530,7 +576,8 @@ func usage() {
   binlog2redis fullsync --tables=a,b    只同步指定表
   binlog2redis status                   查看位点
   binlog2redis reset-position --force   重置位点
-  binlog2redis check                    MySQL / 存储 / 输出端 自检
+  binlog2redis check [--alert-test]     MySQL / 存储 / 输出端 / 告警 自检
+  binlog2redis version                  版本与环境信息
 
 配置：
   --config=path   指定配置文件（默认依次找 config.yaml / configs/config.yaml）

@@ -62,6 +62,11 @@ try {
             exit(run_fullsync($config, $options));
         case 'check':
             exit(run_check($config));
+        case 'version':
+        case '--version':
+        case '-v':
+            show_version();
+            break;
         case 'help':
         case '--help':
         case '-h':
@@ -284,10 +289,57 @@ function run_check(array $config): int
         $check->fail('Redis：' . $e->getMessage());
     }
 
+    // 4. 告警配置：格式校验 + 实际发送一条测试消息
+    $alertCfg = $config['alert'] ?? [];
+    $hasWeCom = !empty($alertCfg['wecom']['key']);
+    $hasDing = !empty($alertCfg['dingtalk']['token']);
+
+    if (!$hasWeCom && !$hasDing) {
+        $check->warn('未配置告警通道（企微/钉钉），故障时只能看日志');
+    } else {
+        if ($hasWeCom) {
+            $check->ok('企微告警已配置（key: ' . substr((string)$alertCfg['wecom']['key'], 0, 8) . '...）');
+        }
+        if ($hasDing) {
+            $ding = $alertCfg['dingtalk'];
+            $mode = !empty($ding['secret']) ? '加签' : (!empty($ding['keyword']) ? '关键词' : 'IP 白名单');
+            $check->ok('钉钉告警已配置（安全模式：' . $mode . '）');
+        }
+
+        // 实际发一条，验证 key/token/签名是否正确
+        if (isset($options['alert-test'])) {
+            try {
+                \BinlogRelay\Alert\NotificationManager::fromConfig(
+                    $alertCfg,
+                    make_logger($config)
+                )->alert(
+                    'check-test',
+                    'binlog-relay 告警测试',
+                    '收到这条消息说明告警通道配置正确。',
+                    ['主机' => gethostname() ?: 'unknown', '时间' => date('Y-m-d H:i:s')]
+                );
+                $check->ok('测试告警已发送，请检查群消息');
+            } catch (Throwable $e) {
+                $check->fail('测试告警发送失败：' . $e->getMessage());
+            }
+        } else {
+            $check->warn('加 --alert-test 可发送一条测试告警，验证配置是否生效');
+        }
+    }
+
     return $check->result();
 }
 
 /* ===================== 配置与工具 ===================== */
+
+/** 版本与环境信息，排查部署问题时先看这个 */
+function show_version(): void
+{
+    echo 'binlog2redis ' . \BinlogRelay\Version::string() . PHP_EOL;
+    foreach (\BinlogRelay\Version::environment() as $k => $v) {
+        printf("  %-8s %s\n", $k, $v);
+    }
+}
 
 function load_config(): array
 {
@@ -376,7 +428,9 @@ binlog2redis · binlog → Redis Stream 单文件服务
   binlog2redis fullsync --tables=a,b    只同步指定表
   binlog2redis status                   查看点位
   binlog2redis reset-position --force   重置点位
-  binlog2redis check                    MySQL / Redis / 点位 自检
+  binlog2redis check                    MySQL / Redis / 点位 / 告警 自检
+  binlog2redis check --alert-test       同时发送一条测试告警
+  binlog2redis version                  版本与环境信息
 
 配置：
   RELAY_CONFIG            配置文件路径，默认 ./config/binlog2redis.php

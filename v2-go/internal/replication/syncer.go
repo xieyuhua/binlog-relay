@@ -110,6 +110,12 @@ func (s *Syncer) Run(ctx context.Context) error {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
 			}
+
+			// 连接类错误可恢复：MySQL 重启、网络抖动、主从切换都会导致断流。
+			// 直接退出会让运维必须人工拉起，所以这里自动重连。
+			if s.reconnect(ctx, err) {
+				continue
+			}
 			return fmt.Errorf("读取 binlog 失败: %w", err)
 		}
 
@@ -117,6 +123,106 @@ func (s *Syncer) Run(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+// reconnect 断线后重建 binlog 连接。
+//
+// 返回 false 表示放弃（ctx 取消或重试耗尽），调用方应退出。
+//
+// 关键点：重连前先把缓冲投递出去并保存位点，否则重连后从旧位点重读会重复，
+// 而缓冲里的数据会丢。
+func (s *Syncer) reconnect(ctx context.Context, cause error) bool {
+	const maxAttempts = 10
+
+	s.log.Warn("binlog 连接中断，准备重连", "err", cause)
+
+	// 先把已解析但未投递的数据落地
+	if err := s.flush(context.WithoutCancel(ctx)); err != nil {
+		s.log.Error("重连前投递失败", "err", err)
+	}
+	if err := s.persist(context.WithoutCancel(ctx)); err != nil {
+		s.log.Error("重连前保存位点失败", "err", err)
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// 指数退避，上限 30 秒：2s, 4s, 8s, 16s, 30s...
+		backoff := time.Duration(1<<uint(attempt)) * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+
+		if err := s.reattach(ctx); err != nil {
+			s.log.Warn("重连失败，稍后重试",
+				"attempt", attempt, "max", maxAttempts, "err", err)
+			continue
+		}
+
+		s.log.Info("重连成功，从当前位点继续", "attempt", attempt)
+		return true
+	}
+
+	s.alerter.Alert(
+		"reconnect",
+		"binlog2redis 重连失败",
+		fmt.Sprintf("重试 %d 次后仍然无法连接 MySQL，进程即将退出。", maxAttempts),
+		map[string]string{
+			"MySQL": s.cfg.MySQL.Host,
+			"错误":    cause.Error(),
+			"主机":    s.owner(),
+		},
+	)
+	return false
+}
+
+// reattach 重建 BinlogSyncer 并从已保存的位点续传
+func (s *Syncer) reattach(ctx context.Context) error {
+	if s.syncer != nil {
+		s.syncer.Close()
+	}
+
+	bs := replication.NewBinlogSyncer(replication.BinlogSyncerConfig{
+		ServerID:        s.cfg.MySQL.ServerID,
+		Flavor:          s.cfg.MySQL.Flavor,
+		Host:            s.cfg.MySQL.Host,
+		Port:            uint16(s.cfg.MySQL.Port),
+		User:            s.cfg.MySQL.User,
+		Password:        s.cfg.MySQL.Password,
+		Charset:         s.cfg.MySQL.Charset,
+		HeartbeatPeriod: s.cfg.MySQL.HeartbeatPeriod,
+		ReadTimeout:     s.cfg.MySQL.ReadTimeout,
+		ParseTime:       true,
+		Logger:          s.log,
+	})
+
+	// 从内存中的最新位点续传（比重读存储更准，因为可能还没落盘）
+	pos := mysql.Position{}
+	if s.cdc != nil && s.cdc.HasFilePosition() {
+		pos = mysql.Position{Name: s.cdc.BinlogFile, Pos: uint32(s.cdc.BinlogPos)}
+	} else {
+		// 没有位点就从头读主库当前位置
+		latest, err := s.masterStatus(ctx)
+		if err != nil {
+			bs.Close()
+			return err
+		}
+		pos = latest
+	}
+
+	streamer, err := bs.StartSync(pos)
+	if err != nil {
+		bs.Close()
+		return fmt.Errorf("重新开始同步失败: %w", err)
+	}
+
+	s.syncer = bs
+	s.streamer = streamer
+	return nil
 }
 
 func (s *Syncer) setup() error {

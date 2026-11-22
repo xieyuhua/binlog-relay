@@ -119,9 +119,6 @@ final class Relay
 
         $builder = Connector::build($this->config, $checkpoint, $this->logger);
 
-        $factory = new MySQLReplicationFactory($builder->build(), logger: $this->logger);
-        $factory->registerSubscriber($this->subscriber);
-
         $this->logger->info(sprintf(
             'relay 启动：%s@%s:%d slave_id=%d 点位存储=%s',
             $mysql['user'],
@@ -131,9 +128,75 @@ final class Relay
             $this->positions->store()->name()
         ));
 
-        $factory->runWithStopCheck(function () use ($deadline): bool {
-            return !$this->running || ($deadline !== null && microtime(true) >= $deadline);
-        });
+        $this->runWithReconnect($builder, $deadline);
+    }
+
+    /**
+     * 带断线重连的运行循环
+     *
+     * MySQL 重启、网络抖动、主从切换都会让连接断开。
+     * 直接退出需要人工拉起，所以这里自动重连并指数退避。
+     */
+    private function runWithReconnect(ConfigBuilder $builder, ?float $deadline): void
+    {
+        $maxAttempts = 10;
+        $attempt = 0;
+
+        while (true) {
+            if (!$this->running || ($deadline !== null && microtime(true) >= $deadline)) {
+                return;
+            }
+
+            try {
+                $factory = new MySQLReplicationFactory($builder->build(), logger: $this->logger);
+                $factory->registerSubscriber($this->subscriber);
+
+                // 每次重连后从最新位点续传
+                $factory->runWithStopCheck(function () use ($deadline): bool {
+                    return !$this->running || ($deadline !== null && microtime(true) >= $deadline);
+                });
+
+                // 正常停止
+                return;
+            } catch (Throwable $e) {
+                $attempt++;
+
+                // 重连前先把缓冲与位点落地，避免重读时重复或丢失
+                try {
+                    $this->positions->flush();
+                } catch (Throwable $flushErr) {
+                    $this->logger->error('重连前落盘失败：' . $flushErr->getMessage());
+                }
+
+                if ($attempt > $maxAttempts) {
+                    $this->alerter->alert(
+                        'reconnect',
+                        'binlog-relay 重连失败',
+                        sprintf('重试 %d 次后仍无法连接 MySQL，进程即将退出。', $maxAttempts),
+                        [
+                            'MySQL' => $this->config['mysql']['host'] ?? '',
+                            '错误'  => $e->getMessage(),
+                        ]
+                    );
+                    throw $e;
+                }
+
+                // 指数退避，上限 30 秒
+                $backoff = min(30, 2 ** $attempt);
+                $this->logger->warn(sprintf(
+                    '连接中断（%s），%d 秒后第 %d/%d 次重连',
+                    $e->getMessage(),
+                    $backoff,
+                    $attempt,
+                    $maxAttempts
+                ));
+                sleep($backoff);
+
+                // 重连时用储存里的最新位点
+                $checkpoint = $this->positions->load();
+                $builder = Connector::build($this->config, $checkpoint, $this->logger);
+            }
+        }
     }
 
     private function makePositionManager(): PositionManager

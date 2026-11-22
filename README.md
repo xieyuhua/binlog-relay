@@ -2453,3 +2453,84 @@ $m->alert('delivery', '投递失败', ...);   // 5 分钟内被丢弃
 
 邮件通知如果需要，可以用同样的 `NotifierInterface` 扩展——实现一个
 `SmtpNotifier` 即可，中间的调度、去重、限流逻辑都能复用。
+
+---
+
+## 32. 断线重连与运维增强
+
+### 32.1 MySQL 断线自动重连（两版）
+
+**问题**：MySQL 重启、网络抖动、主从切换都会让 binlog 连接断开。
+原先的连接断开后直接抛错退出，必须人工拉起。
+
+**现在**：自动重连，指数退避（2/4/8/16/30 秒，最多 10 次）。
+
+```
+[WARN] binlog 连接中断，准备重连 err=unexpected EOF
+[INFO] 重连成功，从当前位点继续 attempt=1
+```
+
+**重连前的关键动作**：
+
+1. 先把缓冲区里未投递的数据 flush 出去
+2. 保存当前位点
+3. 从内存中的最新位点续传（而非存储里的，可能还没落盘）
+
+否则重连后会从旧位点重读，造成重复，而缓冲区数据会丢失。
+
+**重试耗尽**：发告警并退出，由 systemd/容器重启。
+
+### 32.2 自检覆盖告警配置
+
+```bash
+binlog2redis check                 # 校验告警配置格式
+binlog2redis check --alert-test    # 同时发一条测试消息
+```
+
+输出示例：
+
+```
+[OK]   企微告警已配置（key: 693a91f6...）
+[OK]   钉钉告警已配置（安全模式：加签）
+[WARN] 加 --alert-test 可发送一条测试告警，验证配置是否生效
+```
+
+**建议部署后跑一次 `--alert-test`**——key 拼错、钉钉关键词不匹配这类问题，
+不带 `--alert-test` 是发现不了的（只会在真出事时静默失败）。
+
+### 32.3 版本与环境信息
+
+```bash
+$ binlog2redis version
+binlog2redis 1.2.0
+  PHP      8.4.8
+  SAPI     cli
+  OS       Windows
+  扩展      sockets,bcmath,redis,pdo_mysql
+  打包模式  source
+```
+
+Go 版：
+
+```bash
+$ binlog2redis version
+binlog2redis 1.2.0
+  GOOS    linux
+  GOARCH  amd64
+  Go      go1.26.5
+  CPU     16
+```
+
+排查「线上是哪个版本」「扩展装没装」「是不是跑在 phar 里」这类问题很快。
+
+打包时注入版本：
+
+```bash
+# Go
+go build -ldflags "-X github.com/biaoge/binlog2redis/internal/version.Version=1.2.0 \
+                   -X github.com/biaoge/binlog2redis/internal/version.BuildTime=$(date -Iseconds)" \
+         -o bin/binlog2redis ./cmd
+
+# PHP（环境变量注入）
+RELAY_VERSION=1.2.0 RELAY_BUILD_TIME=$(date -Iseconds) ./build/build.sh
+```
