@@ -23,6 +23,7 @@ $tests = [
     'GTID 集合' => __DIR__ . '/GtidSetTest.php',
     'DDL 识别' => __DIR__ . '/DdlChangeTest.php',
     '全量同步分页' => __DIR__ . '/FullSyncTest.php',
+    '告警通知' => __DIR__ . '/AlertTest.php',
 
 ];
 

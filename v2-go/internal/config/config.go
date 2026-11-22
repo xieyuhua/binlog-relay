@@ -18,6 +18,7 @@ type Config struct {
 	Checkpoint CheckpointConfig `yaml:"checkpoint"`
 	Log        LogConfig        `yaml:"log"`
 	Runtime    RuntimeConfig    `yaml:"runtime"`
+	Alert      AlertConfig      `yaml:"alert"`
 }
 
 type MySQLConfig struct {
@@ -137,6 +138,34 @@ type CheckpointConfig struct {
 	GtidSet bool `yaml:"gtid_set"`
 }
 
+// AlertConfig 告警通知配置
+type AlertConfig struct {
+	// Cooldown 同一类告警的去重窗口
+	Cooldown time.Duration `yaml:"cooldown"`
+	// MaxPerMinute 每分钟最多发送条数（企微/钉钉均为 20/分钟）
+	MaxPerMinute int         `yaml:"max_per_minute"`
+	WeCom        WeComConfig `yaml:"wecom"`
+	DingTalk     DingTalkCfg `yaml:"dingtalk"`
+}
+
+type WeComConfig struct {
+	// Key 群机器人 Webhook 地址里 key= 后的部分
+	Key string `yaml:"key"`
+}
+
+type DingTalkCfg struct {
+	Token string `yaml:"token"`
+	// Secret 加签密钥；用关键词或 IP 白名单时留空
+	Secret string `yaml:"secret"`
+	// Keyword 关键词模式时必须出现在消息里
+	Keyword string `yaml:"keyword"`
+}
+
+// Enabled 判断是否配置了任何通道
+func (a AlertConfig) Enabled() bool {
+	return a.WeCom.Key != "" || a.DingTalk.Token != ""
+}
+
 type LogConfig struct {
 	Level  string `yaml:"level"`
 	Format string `yaml:"format"` // text | json
@@ -203,6 +232,10 @@ func Default() *Config {
 			EverySeconds: time.Second,
 		},
 		Log: LogConfig{Level: "info", Format: "text"},
+		Alert: AlertConfig{
+			Cooldown:     5 * time.Minute,
+			MaxPerMinute: 15,
+		},
 		Runtime: RuntimeConfig{
 			BatchSize:     200,
 			FullSyncBatch: 1000,

@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/biaoge/binlog2redis/internal/alert"
 	"github.com/biaoge/binlog2redis/internal/checkpoint"
 	"github.com/biaoge/binlog2redis/internal/config"
 	"github.com/biaoge/binlog2redis/internal/fullsync"
@@ -123,7 +124,8 @@ func runStart(ctx context.Context, cfg *config.Config, log *slog.Logger, seconds
 		log.Info("限时运行", "seconds", seconds)
 	}
 
-	syncer := replication.NewSyncer(cfg, log, prod, store)
+	alerter := buildAlerter(cfg, log)
+	syncer := replication.NewSyncer(cfg, log, prod, store, alerter)
 	if err := syncer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("同步异常退出", "err", err)
 		return 1
@@ -382,6 +384,26 @@ func runCheck(ctx context.Context, cfg *config.Config, log *slog.Logger) int {
 }
 
 // ---------- 辅助 ----------
+
+// buildAlerter 按配置构造告警管理器；未配置任何通道时返回空管理器（所有调用是空操作）
+func buildAlerter(cfg *config.Config, log *slog.Logger) *alert.Manager {
+	m := alert.NewManager(log, cfg.Alert.Cooldown, cfg.Alert.MaxPerMinute)
+
+	if cfg.Alert.WeCom.Key != "" {
+		m.Add(alert.NewWeCom(cfg.Alert.WeCom.Key))
+		log.Info("告警通道已启用", "channel", "wecom")
+	}
+	if cfg.Alert.DingTalk.Token != "" {
+		m.Add(alert.NewDingTalk(
+			cfg.Alert.DingTalk.Token,
+			cfg.Alert.DingTalk.Secret,
+			cfg.Alert.DingTalk.Keyword,
+		))
+		log.Info("告警通道已启用", "channel", "dingtalk")
+	}
+
+	return m
+}
 
 // startLockRefresh 每 20 秒续期一次（TTL 60 秒，留足余量）。
 // 返回的函数用于停止续期。

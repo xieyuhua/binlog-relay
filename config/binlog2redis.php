@@ -113,6 +113,32 @@ return [
     // 每批交给写入器的变更行数
     'batch_size' => (int) env('RELAY_BATCH_SIZE', 200),
 
+    // ---------- 告警通知 ----------
+    // 配置后，致命错误、投递持续失败、无主键表等会推送到企微/钉钉
+    'alert' => [
+        // 同一类告警的去重窗口（秒），避免故障刷屏
+        'cooldown_seconds' => (int) env('RELAY_ALERT_COOLDOWN', 300),
+        // 每分钟最多发送条数（企微/钉钉均为 20/分钟，留余量）
+        'max_per_minute' => (int) env('RELAY_ALERT_MAX_PER_MIN', 15),
+        'timeout' => 5.0,
+
+        // 企业微信群机器人
+        // 在群设置 → 群机器人 → 添加 → 复制 Webhook 地址，取 key= 后的部分
+        'wecom' => [
+            'key' => env('RELAY_WECOM_KEY', ''),
+        ],
+
+        // 钉钉群机器人
+        // 安全设置三选一：自定义关键词 / 加签 / IP 白名单
+        'dingtalk' => [
+            'token'  => env('RELAY_DINGTALK_TOKEN', ''),
+            // 用「加签」时必须填；用关键词或 IP 白名单可留空
+            'secret' => env('RELAY_DINGTALK_SECRET', ''),
+            // 用「自定义关键词」时填关键词，会自动加到消息开头
+            'keyword' => env('RELAY_DINGTALK_KEYWORD', ''),
+        ],
+    ],
+
     'log' => [
         'level' => env('RELAY_LOG_LEVEL', 'info'),
         'file'  => env('RELAY_LOG_FILE', ''),   // 空则输出到 stderr

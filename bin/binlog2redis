@@ -74,6 +74,27 @@ try {
     }
 } catch (Throwable $e) {
     fwrite(STDERR, '错误：' . $e->getMessage() . PHP_EOL);
+
+    // 致命错误也要告警：进程即将退出，这是最需要人工介入的场景。
+    // 告警失败不能掩盖原始错误，所以整个告警过程包在 try 里。
+    try {
+        \BinlogRelay\Alert\NotificationManager::fromConfig(
+            $config['alert'] ?? [],
+            make_logger($config)
+        )->alert(
+            'fatal',
+            'binlog2redis 异常退出',
+            $e->getMessage(),
+            [
+                '命令' => $command,
+                '异常' => get_class($e),
+                '位置' => basename($e->getFile()) . ':' . $e->getLine(),
+                '主机' => gethostname() ?: 'unknown',
+            ]
+        );
+    } catch (Throwable) {
+    }
+
     exit(1);
 }
 

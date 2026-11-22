@@ -26,3 +26,21 @@ runtime:
   # 全量同步是否包含视图
   # 视图数据来自基表，会与基表数据重复入队，下游需按 table 区分
   include_views: false
+
+alert:
+  # 同一类告警的去重窗口，避免故障刷屏
+  cooldown: 5m
+  # 每分钟最多发送条数（企微/钉钉均为 20/分钟，留余量）
+  max_per_minute: 15
+
+  # 企业微信群机器人
+  # 群设置 → 群机器人 → 添加 → 复制 Webhook，取 key= 后的部分
+  wecom:
+    key: ""
+
+  # 钉钉群机器人
+  # 安全设置三选一：自定义关键词 / 加签 / IP 白名单
+  dingtalk:
+    token: ""
+    secret: ""      # 用「加签」时必填
+    keyword: ""     # 用「自定义关键词」时填，会自动加到消息开头

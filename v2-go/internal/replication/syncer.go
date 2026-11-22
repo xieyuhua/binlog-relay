@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/biaoge/binlog2redis/internal/alert"
 	"github.com/biaoge/binlog2redis/internal/checkpoint"
 	"github.com/biaoge/binlog2redis/internal/config"
 	"github.com/biaoge/binlog2redis/internal/event"
@@ -29,6 +30,7 @@ type Syncer struct {
 	schema   *SchemaLoader
 	producer producer.Producer
 	store    checkpoint.Store
+	alerter  *alert.Manager
 
 	// 批量缓冲
 	buf       []*event.Envelope
@@ -54,13 +56,14 @@ type Syncer struct {
 
 // NewSyncer 构造同步器
 func NewSyncer(cfg *config.Config, log *slog.Logger,
-	prod producer.Producer, store checkpoint.Store) *Syncer {
+	prod producer.Producer, store checkpoint.Store, alerter *alert.Manager) *Syncer {
 	return &Syncer{
 		cfg:           cfg,
 		log:           log,
 		parser:        NewParser(filter.New(cfg.Filter), cfg.Filter.EmitDDL),
 		producer:      prod,
 		store:         store,
+		alerter:       alerter,
 		lastFlush:     time.Now(),
 		lastPersistAt: time.Now(),
 	}
@@ -318,6 +321,17 @@ func (s *Syncer) ensureTableKeys(ctx context.Context, e *replication.RowsEvent) 
 		// 查不到主键不应中断同步：退化为行哈希，但要告警
 		s.log.Warn("查询主键失败，该表将使用行哈希作幂等键",
 			"table", database+"."+table, "err", err)
+		if s.alerter != nil {
+			s.alerter.Alert(
+				"missing-key",
+				"存在无主键表",
+				"幂等键会退化为行内容哈希，下游按主键去重会失效。",
+				map[string]string{
+					"表":  database + "." + table,
+					"错误": err.Error(),
+				},
+			)
+		}
 		return nil
 	}
 	s.parser.SetTableKeys(database, table, keys)
@@ -410,9 +424,24 @@ func (s *Syncer) flush(ctx context.Context) error {
 		}
 	}
 
-	// 重试耗尽：放回缓冲（供日志/排障），返回错误让上层退出
+	// 重试耗尽：放回缓冲（供日志/排障），告警后返回错误让上层退出
 	s.buf = append(batch, s.buf...)
 	s.bufRows = len(s.buf)
+
+	if s.alerter != nil {
+		s.alerter.Alert(
+			"delivery",
+			"binlog2redis 投递持续失败",
+			fmt.Sprintf("重试 %d 次后仍失败，进程即将退出。位点未推进，重启后会重新读取。", maxAttempts),
+			map[string]string{
+				"下游":   s.producer.Name(),
+				"本批条数": fmt.Sprintf("%d", len(batch)),
+				"错误":   lastErr.Error(),
+				"主机":   s.owner(),
+			},
+		)
+	}
+
 	return fmt.Errorf("投递失败，重试 %d 次后放弃（%d 条）: %w", maxAttempts, len(batch), lastErr)
 }
 

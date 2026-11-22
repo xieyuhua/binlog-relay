@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BinlogRelay\Relay;
 
+use BinlogRelay\Alert\NotificationManager;
 use BinlogRelay\Checkpoint\Checkpoint;
 use BinlogRelay\Checkpoint\FileStore;
 use BinlogRelay\Checkpoint\PositionManager;
@@ -24,6 +25,7 @@ final class Relay
 {
     private array $config;
     private Logger $logger;
+    private NotificationManager $alerter;
     private PositionManager $positions;
     private HandlerChain $handlers;
     private RowSubscriber $subscriber;
@@ -50,14 +52,31 @@ final class Relay
 
     public function boot(): void
     {
+        // 告警通道：配置了企微/钉钉才会真正发送，否则所有 alert() 是空操作
+        $this->alerter = NotificationManager::fromConfig(
+            $this->config['alert'] ?? [],
+            $this->logger
+        );
+        if (!$this->alerter->isEmpty()) {
+            $this->logger->info('告警已启用', ['channels' => $this->config['alert']['_channels'] ?? '']);
+        }
+
         $this->positions = $this->makePositionManager();
         $this->positions->lock();
 
         $this->handlers = new HandlerChain($this->logger);
         $this->handlers->build($this->config['handlers'] ?? []);
 
-        // 无主键表只告警一次，避免每个事件都刷日志
-        EventBuilder::onMissingKey(fn(string $msg) => $this->logger->warning($msg));
+        // 无主键表：日志 + 告警（去重由 NotificationManager 负责）
+        EventBuilder::onMissingKey(function (string $msg): void {
+            $this->logger->warning($msg);
+            $this->alerter->alert(
+                'missing-key',
+                '存在无主键表',
+                $msg . "\n\n幂等键会退化为行内容哈希，建议为该表添加主键。",
+                ['影响' => '下游按主键去重会失效']
+            );
+        });
 
         // DDL 需要额外订阅 QUERY 事件；getSubscribedEvents() 是静态的，
         // 必须在构造订阅者之前设置开关
