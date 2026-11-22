@@ -55,14 +55,21 @@ func NewSyncer(db *sql.DB, log *slog.Logger, prod producer.Producer, batch int) 
 	return &Syncer{db: db, log: log, prod: prod, batch: batch, flushSize: flushSize}
 }
 
-// Table 是一张待同步的表
+// Table 是一个待同步的对象（基表或视图）
 type Table struct {
 	Database string
 	Table    string
+	// IsView 标识是否为视图。视图没有主键，会走整表全读路径。
+	IsView bool
 }
 
-// ListTables 列出待同步的表
-func (s *Syncer) ListTables(ctx context.Context, cfg *config.Config, only []string) ([]Table, error) {
+// ListTables 列出待同步的对象。
+//
+// includeViews 为 true 时把视图也纳入。视图的数据来自基表，
+// 同一份数据会以不同 table 名重复入队，下游需按 table 区分或去重。
+func (s *Syncer) ListTables(
+	ctx context.Context, cfg *config.Config, only []string, includeViews bool,
+) ([]Table, error) {
 	ignore := cfg.Filter.IgnoreDatabases
 	if len(ignore) == 0 {
 		ignore = []string{"mysql", "sys", "information_schema", "performance_schema"}
@@ -72,8 +79,13 @@ func (s *Syncer) ListTables(ctx context.Context, cfg *config.Config, only []stri
 		conditions []string
 		args       []any
 	)
-	conditions = append(conditions, "TABLE_TYPE = ?")
-	args = append(args, "BASE TABLE")
+	if includeViews {
+		conditions = append(conditions, "TABLE_TYPE IN (?, ?)")
+		args = append(args, "BASE TABLE", "VIEW")
+	} else {
+		conditions = append(conditions, "TABLE_TYPE = ?")
+		args = append(args, "BASE TABLE")
+	}
 
 	placeholders := make([]string, len(ignore))
 	for i, db := range ignore {
@@ -104,7 +116,7 @@ func (s *Syncer) ListTables(ctx context.Context, cfg *config.Config, only []stri
 		conditions = append(conditions, "TABLE_NAME IN ("+strings.Join(ph, ",")+")")
 	}
 
-	query := `SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES WHERE ` +
+	query := `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE ` +
 		strings.Join(conditions, " AND ") + ` ORDER BY TABLE_SCHEMA, TABLE_NAME`
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -116,9 +128,11 @@ func (s *Syncer) ListTables(ctx context.Context, cfg *config.Config, only []stri
 	var out []Table
 	for rows.Next() {
 		var t Table
-		if err := rows.Scan(&t.Database, &t.Table); err != nil {
+		var tableType string
+		if err := rows.Scan(&t.Database, &t.Table, &tableType); err != nil {
 			return nil, err
 		}
+		t.IsView = strings.EqualFold(tableType, "VIEW")
 		out = append(out, t)
 	}
 	return out, rows.Err()

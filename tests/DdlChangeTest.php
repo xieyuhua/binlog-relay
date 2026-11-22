@@ -34,7 +34,10 @@ $cases = [
     'DROP INDEX idx ON orders'                  => DdlChange::DROP_INDEX,
     'CREATE DATABASE demo'                      => DdlChange::CREATE_DATABASE,
     'DROP SCHEMA demo'                          => DdlChange::DROP_DATABASE,
-    'CREATE VIEW v AS SELECT 1'                 => DdlChange::OTHER,
+    'CREATE VIEW v AS SELECT 1'                 => DdlChange::CREATE_VIEW,
+    'CREATE OR REPLACE VIEW v AS SELECT 1'      => DdlChange::CREATE_VIEW,
+    'ALTER VIEW v AS SELECT 2'                  => DdlChange::ALTER_VIEW,
+    'DROP VIEW IF EXISTS v'                     => DdlChange::DROP_VIEW,
     'CREATE TRIGGER t BEFORE INSERT ON o'       => DdlChange::OTHER,
     '/* comment */ ALTER TABLE t ADD c INT'     => DdlChange::ALTER_TABLE,
 ];
@@ -57,6 +60,9 @@ $tableCases = [
     'TRUNCATE TABLE logs'                   => ['logs'],
     'RENAME TABLE a TO b, c TO d'           => ['a', 'b', 'c', 'd'],
     'CREATE TABLE IF NOT EXISTS `t1` (id INT)' => ['t1'],
+    'CREATE VIEW v_orders AS SELECT 1'          => ['v_orders'],
+    'ALTER VIEW v AS SELECT 2'                  => ['v'],
+    'DROP VIEW IF EXISTS v3'                    => ['v3'],
 ];
 foreach ($tableCases as $sql => $want) {
     $got = DdlChange::extractTables($sql);

@@ -105,6 +105,9 @@ return [
     'fullsync' => [
         // 每批从源库读取的行数
         'batch_size' => (int) env('RELAY_FULLSYNC_BATCH', 1000),
+        // 是否把视图也纳入全量同步
+        // 注意：视图数据来自基表，会与基表数据重复入队，下游需按 table 区分
+        'include_views' => (bool) env('RELAY_FULLSYNC_VIEWS', false),
     ],
 
     // 每批交给写入器的变更行数

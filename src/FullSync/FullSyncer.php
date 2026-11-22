@@ -47,19 +47,26 @@ final class FullSyncer
     /**
      * 列出待同步的表
      *
-     * @param list<string> $databases 为空表示全部（排除系统库）
-     * @param list<string> $tables    为空表示这些库的全部表
-     * @return list<array{database:string,table:string}>
+     * $includeViews 为 true 时把视图也纳入。
+     * 注意：视图的数据来自基表，同一份数据会以不同 table 名重复入队，
+     * 下游需要按 table 区分处理，或自行去重。
+     *
+     * @param list<string> $databases    为空表示全部（排除系统库）
+     * @param list<string> $tables       为空表示这些库的全部表
+     * @param bool         $includeViews 是否包含视图
+     * @return list<array{database:string,table:string,type:string}>
      */
-    public function listTables(array $databases = [], array $tables = []): array
+    public function listTables(array $databases = [], array $tables = [], bool $includeViews = false): array
     {
         $ignore = ['mysql', 'sys', 'information_schema', 'performance_schema'];
 
-        $sql = 'SELECT TABLE_SCHEMA AS db, TABLE_NAME AS tbl
+        $types = $includeViews ? ['BASE TABLE', 'VIEW'] : ['BASE TABLE'];
+
+        $sql = 'SELECT TABLE_SCHEMA AS db, TABLE_NAME AS tbl, TABLE_TYPE AS type
                 FROM information_schema.TABLES
-                WHERE TABLE_TYPE = ?
+                WHERE TABLE_TYPE IN (' . implode(',', array_fill(0, count($types), '?')) . ')
                   AND TABLE_SCHEMA NOT IN (' . implode(',', array_fill(0, count($ignore), '?')) . ')';
-        $params = array_merge(['BASE TABLE'], $ignore);
+        $params = array_merge($types, $ignore);
 
         if ($databases !== []) {
             $sql .= ' AND TABLE_SCHEMA IN (' . implode(',', array_fill(0, count($databases), '?')) . ')';
@@ -75,7 +82,11 @@ final class FullSyncer
         $stmt->execute($params);
 
         return array_map(
-            static fn(array $r) => ['database' => $r['db'], 'table' => $r['tbl']],
+            static fn(array $r) => [
+                'database' => $r['db'],
+                'table'    => $r['tbl'],
+                'type'     => strtoupper((string)$r['type']) === 'VIEW' ? 'view' : 'table',
+            ],
             $stmt->fetchAll()
         );
     }

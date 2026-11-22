@@ -20,7 +20,10 @@ func TestClassifyDDL(t *testing.T) {
 		{"DROP INDEX idx ON orders", "drop_index"},
 		{"CREATE DATABASE demo", "create_database"},
 		{"DROP SCHEMA demo", "drop_database"},
-		{"CREATE VIEW v AS SELECT 1", "other"},
+		{"CREATE VIEW v AS SELECT 1", "create_view"},
+		{"CREATE OR REPLACE VIEW v AS SELECT 1", "create_view"},
+		{"ALTER VIEW v AS SELECT 2", "alter_view"},
+		{"DROP VIEW IF EXISTS v", "drop_view"},
 		{"CREATE TRIGGER t BEFORE INSERT ON o", "other"},
 		{"/* comment */ ALTER TABLE t ADD c INT", "alter_table"},
 		// 非 DDL
@@ -48,6 +51,9 @@ func TestExtractTables(t *testing.T) {
 		{"DROP TABLE IF EXISTS `shop`.`orders`", []string{"orders"}},
 		{"ALTER TABLE orders ADD COLUMN x INT", []string{"orders"}},
 		{"TRUNCATE TABLE logs", []string{"logs"}},
+		{"CREATE VIEW v_orders AS SELECT 1", []string{"v_orders"}},
+		{"CREATE OR REPLACE VIEW shop.v2 AS SELECT 2", []string{"v2"}},
+		{"DROP VIEW IF EXISTS v3", []string{"v3"}},
 		{"RENAME TABLE a TO b, c TO d", []string{"a", "b", "c", "d"}},
 		{"CREATE DATABASE demo", []string{}},
 	}

@@ -19,3 +19,10 @@ producer:
 checkpoint:
   driver: file
   path: var/checkpoint.json
+
+runtime:
+  batch_size: 200
+  fullsync_batch: 1000
+  # 全量同步是否包含视图
+  # 视图数据来自基表，会与基表数据重复入队，下游需按 table 区分
+  include_views: false

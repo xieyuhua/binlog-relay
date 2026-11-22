@@ -161,7 +161,7 @@ func runFullsync(ctx context.Context, cfg *config.Config, log *slog.Logger, dryR
 	}
 
 	planner := fullsync.NewSyncer(db, log, nil, 0)
-	tbls, err := planner.ListTables(ctx, cfg, only)
+	tbls, err := planner.ListTables(ctx, cfg, only, cfg.Runtime.IncludeViews)
 	if err != nil {
 		log.Error("列出待同步表失败", "err", err)
 		return 1
@@ -171,10 +171,14 @@ func runFullsync(ctx context.Context, cfg *config.Config, log *slog.Logger, dryR
 		return 1
 	}
 
-	log.Info("待同步表", "count", len(tbls))
+	log.Info("待同步对象", "count", len(tbls))
 	if dryRun {
 		for _, t := range tbls {
-			fmt.Printf("  %s.%s\n", t.Database, t.Table)
+			kind := ""
+			if t.IsView {
+				kind = "[视图] "
+			}
+			fmt.Printf("  %s%s.%s\n", kind, t.Database, t.Table)
 		}
 		fmt.Println("\n（--dry-run，未推送任何数据）")
 		return 0

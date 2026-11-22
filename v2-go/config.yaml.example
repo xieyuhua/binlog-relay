@@ -27,3 +27,8 @@ checkpoint:
 #   - target: theme-b
 #     tables: ["*"]
 #     labels: {env: prod}
+
+runtime:
+  batch_size: 200
+  fullsync_batch: 1000
+  include_views: false   # 全量同步是否包含视图

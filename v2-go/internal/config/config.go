@@ -148,6 +148,9 @@ type RuntimeConfig struct {
 	BatchSize int `yaml:"batch_size"`
 	// FullSyncBatch 全量同步每批行数
 	FullSyncBatch int `yaml:"fullsync_batch"`
+	// IncludeViews 全量同步是否包含视图。
+	// 视图数据来自基表，会与基表数据重复入队，下游需按 table 区分。
+	IncludeViews bool `yaml:"include_views"`
 }
 
 // Default 返回带合理默认值的配置

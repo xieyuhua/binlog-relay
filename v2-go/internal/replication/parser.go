@@ -271,11 +271,18 @@ func classifyDDL(query string) string {
 		return "create_database"
 	case strings.HasPrefix(upper, "DROP DATABASE"), strings.HasPrefix(upper, "DROP SCHEMA"):
 		return "drop_database"
-	case strings.HasPrefix(upper, "CREATE VIEW"), strings.HasPrefix(upper, "ALTER VIEW"),
-		strings.HasPrefix(upper, "DROP VIEW"), strings.HasPrefix(upper, "CREATE PROCEDURE"),
-		strings.HasPrefix(upper, "DROP PROCEDURE"), strings.HasPrefix(upper, "CREATE FUNCTION"),
-		strings.HasPrefix(upper, "DROP FUNCTION"), strings.HasPrefix(upper, "CREATE TRIGGER"),
-		strings.HasPrefix(upper, "DROP TRIGGER"):
+	// 视图单独识别，便于下游重建视图或刷新元数据。
+	// 注意判断顺序：CREATE OR REPLACE VIEW 要先于 CREATE PROCEDURE 等分支。
+	case strings.HasPrefix(upper, "CREATE OR REPLACE VIEW"), strings.HasPrefix(upper, "CREATE VIEW"):
+		return "create_view"
+	case strings.HasPrefix(upper, "ALTER VIEW"):
+		return "alter_view"
+	case strings.HasPrefix(upper, "DROP VIEW"):
+		return "drop_view"
+	// 存储过程/函数/触发器仍归到 other
+	case strings.HasPrefix(upper, "CREATE PROCEDURE"), strings.HasPrefix(upper, "DROP PROCEDURE"),
+		strings.HasPrefix(upper, "CREATE FUNCTION"), strings.HasPrefix(upper, "DROP FUNCTION"),
+		strings.HasPrefix(upper, "CREATE TRIGGER"), strings.HasPrefix(upper, "DROP TRIGGER"):
 		return "other"
 	}
 	return ""
@@ -295,7 +302,11 @@ func extractTables(query string) []string {
 	}
 
 	upper := strings.ToUpper(query)
-	keywords := []string{"CREATE TABLE", "DROP TABLE", "ALTER TABLE", "TRUNCATE TABLE"}
+	keywords := []string{
+		"CREATE TABLE", "DROP TABLE", "ALTER TABLE", "TRUNCATE TABLE",
+		// 视图也提取名字，便于下游重建
+		"CREATE OR REPLACE VIEW", "CREATE VIEW", "ALTER VIEW", "DROP VIEW",
+	}
 	for _, kw := range keywords {
 		idx := strings.Index(upper, kw)
 		if idx < 0 {

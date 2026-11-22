@@ -182,9 +182,12 @@ function run_fullsync(array $config, array $options): int
         (int)($config['fullsync']['batch_size'] ?? 1000)
     );
 
+    // include_views：是否把视图也纳入全量同步
+    $includeViews = !empty($config['fullsync']['include_views']);
     $tables = $syncer->listTables(
         $filter['databases'] ?? [],
-        $onlyTables !== [] ? $onlyTables : ($filter['tables'] ?? [])
+        $onlyTables !== [] ? $onlyTables : ($filter['tables'] ?? []),
+        $includeViews
     );
 
     if ($tables === []) {
@@ -192,10 +195,11 @@ function run_fullsync(array $config, array $options): int
         return 1;
     }
 
-    $logger->info(sprintf('待同步 %d 张表', count($tables)));
+    $logger->info(sprintf('待同步 %d 个对象', count($tables)));
     if ($dryRun) {
         foreach ($tables as $t) {
-            echo "  {$t['database']}.{$t['table']}\n";
+            $kind = ($t['type'] ?? 'table') === 'view' ? '[视图] ' : '';
+            echo "  {$kind}{$t['database']}.{$t['table']}\n";
         }
         echo "\n（--dry-run，未推送任何数据）\n";
         return 0;

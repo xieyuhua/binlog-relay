@@ -2223,3 +2223,101 @@ final class MyFormatter implements HandlerInterface
    （要计算、要合并多行、要查表），模板最终会退化成一个 DSL
 
 自定义 Handler 用 20 行代码就能覆盖所有场景，且是强类型的。
+
+---
+
+## 30. 视图支持
+
+### 30.1 MySQL 视图在 binlog 里的行为（重要前提）
+
+**对视图执行 DML 不产生独立事件。** `INSERT/UPDATE/DELETE 视图` 实际写入的是
+底层基表，binlog 里记录的是**基表**的行变更。
+
+所以：
+
+| 需求 | 是否需要额外配置 |
+|---|---|
+| 增量同步视图的**数据变化** | ❌ 自动就有（底表变更已被捕获） |
+| 增量同步视图的**结构变更** | ✅ 需 `emit_ddl: true` |
+| 全量同步**视图的数据** | ✅ 需 `include_views: true` |
+
+### 30.2 视图 DDL
+
+开启 `emit_ddl` 后，视图结构变更会作为独立事件输出：
+
+```json
+{
+  "kind": "ddl",
+  "op": "create_view",
+  "db": "shop",
+  "table": "v_orders",
+  "ddl_tables": ["v_orders"],
+  "ddl_query": "CREATE VIEW v_orders AS SELECT ..."
+}
+```
+
+| op | 触发语句 |
+|---|---|
+| `create_view` | `CREATE VIEW` / `CREATE OR REPLACE VIEW` |
+| `alter_view` | `ALTER VIEW` |
+| `drop_view` | `DROP VIEW` |
+
+存储过程、函数、触发器仍归入 `other`。
+
+### 30.3 全量同步视图
+
+默认**不包含**视图（避免与基表数据重复）。开启方式：
+
+```php
+// PHP: config/binlog2redis.php
+'fullsync' => [
+    'include_views' => true,
+],
+```
+
+```yaml
+# Go: config.yaml
+runtime:
+  include_views: true
+```
+
+或环境变量 `RELAY_FULLSYNC_VIEWS=1`。
+
+预览时视图会带标记：
+
+```bash
+$ binlog2redis fullsync --dry-run
+  shop.orders
+  [视图] shop.v_orders
+```
+
+### 30.4 使用视图同步的注意事项
+
+**1. 数据会重复**
+
+视图的数据来自基表。开启 `include_views` 后，同一行数据会以两个
+`table` 名各推一次（`orders` 和 `v_orders`）。下游必须：
+
+- 按 `table` 字段区分处理，或
+- 只订阅基表，忽略视图事件
+
+**2. 视图无主键**
+
+`information_schema` 里视图没有主键，全量同步会走「整表全读」路径
+（不能游标分页），大视图上内存占用较高。
+
+**3. 下游建表要注意**
+
+如果目标是 MySQL 镜像库，接收端要能执行 `CREATE VIEW`，
+但视图依赖的基表必须已同步——建议**先同步基表，再同步视图**。
+
+**4. 不建议的场景**
+
+| 场景 | 建议 |
+|---|---|
+| 视图只是简单聚合 | 下游自己算，别同步 |
+| 视图跨库 JOIN | 依赖关系复杂，容易时序错乱 |
+| 视图用于 BI 查询 | 直接查源库，不必同步 |
+
+**推荐做法**：**只同步基表**，视图由下游按需创建。
+如果确实要同步视图数据（比如下游不方便建视图），再开启开关。

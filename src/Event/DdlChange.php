@@ -26,6 +26,9 @@ final readonly class DdlChange
     public const DROP_INDEX = 'drop_index';
     public const CREATE_DATABASE = 'create_database';
     public const DROP_DATABASE = 'drop_database';
+    public const CREATE_VIEW = 'create_view';
+    public const ALTER_VIEW = 'alter_view';
+    public const DROP_VIEW = 'drop_view';
     public const OTHER = 'other';
 
     public function __construct(
@@ -93,10 +96,13 @@ final readonly class DdlChange
             str_starts_with($upper, 'CREATE SCHEMA')     => self::CREATE_DATABASE,
             str_starts_with($upper, 'DROP DATABASE'),
             str_starts_with($upper, 'DROP SCHEMA')       => self::DROP_DATABASE,
-            // 视图、存储过程等也算结构变更，统一归到 other
-            str_starts_with($upper, 'CREATE VIEW'),
-            str_starts_with($upper, 'ALTER VIEW'),
-            str_starts_with($upper, 'DROP VIEW'),
+            // 视图单独识别，便于下游重建视图或刷新元数据
+            // CREATE OR REPLACE VIEW 必须先于 CREATE VIEW 判断
+            str_starts_with($upper, 'CREATE OR REPLACE VIEW') => self::CREATE_VIEW,
+            str_starts_with($upper, 'CREATE VIEW')       => self::CREATE_VIEW,
+            str_starts_with($upper, 'ALTER VIEW')        => self::ALTER_VIEW,
+            str_starts_with($upper, 'DROP VIEW')         => self::DROP_VIEW,
+            // 存储过程/函数/触发器仍归到 other
             str_starts_with($upper, 'CREATE PROCEDURE'),
             str_starts_with($upper, 'DROP PROCEDURE'),
             str_starts_with($upper, 'CREATE FUNCTION'),
@@ -123,6 +129,18 @@ final readonly class DdlChange
         // CREATE TABLE / DROP TABLE / TRUNCATE TABLE / ALTER TABLE
         if (preg_match_all(
             '/\b(?:CREATE|DROP|ALTER|TRUNCATE)\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?'
+            . '((?:`[^`]+`|[A-Za-z0-9_$]+)(?:\s*\.\s*(?:`[^`]+`|[A-Za-z0-9_$]+))?)/i',
+            $query,
+            $m
+        )) {
+            foreach ($m[1] as $name) {
+                $tables[] = self::normalizeName($name);
+            }
+        }
+
+        // CREATE/ALTER/DROP VIEW
+        if (preg_match_all(
+            '/\b(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?:IF\s+EXISTS\s+)?'
             . '((?:`[^`]+`|[A-Za-z0-9_$]+)(?:\s*\.\s*(?:`[^`]+`|[A-Za-z0-9_$]+))?)/i',
             $query,
             $m
